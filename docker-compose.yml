@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: bet1v1
+      POSTGRES_USER: bet1v1
+      POSTGRES_PASSWORD: bet1v1
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bet1v1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./api
+    environment: &api-environment
+      PORT: 3001
+      DATABASE_URL: postgres://bet1v1:bet1v1@postgres:5432/bet1v1
+      REDIS_URL: redis://redis:6379
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-http://host.docker.internal:8899}
+      PROGRAM_ID: ${PROGRAM_ID:-8rqv4B1Sw4xweu4kWEHGnqoTQbQvRKuxSturDsz32i4v}
+      TOKEN_MINT: ${TOKEN_MINT:-So11111111111111111111111111111111111111112}
+      CHAIN_AUTHORITY_SECRET: ${CHAIN_AUTHORITY_SECRET:-}
+      MOCK_CHAIN: ${MOCK_CHAIN:-true}
+      MOCK_REQUIRED_STAKE: ${MOCK_REQUIRED_STAKE:-1000000000}
+      ADMIN_KEY: ${ADMIN_KEY:-local-admin}
+      CS2_SERVER_ADDRESS: ${CS2_SERVER_ADDRESS:-127.0.0.1:27015}
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: ./api
+    command: ["node", "dist/worker.js"]
+    environment: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  app:
+    build:
+      context: ./app
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  cs2:
+    profiles: ["cs2"]
+    build:
+      context: https://github.com/kus/cs2-modded-server.git#master
+    environment:
+      API_KEY: ${STEAM_API_KEY:-}
+      STEAM_ACCOUNT: ${STEAM_ACCOUNT:-}
+      RCON_PASSWORD: ${RCON_PASSWORD:-bet1v1-local}
+      SERVER_PASSWORD: ${SERVER_PASSWORD:-}
+      MAXPLAYERS: 2
+      PORT: 27015
+      LAN: ${CS2_LAN:-0}
+      EXEC: on_boot.cfg
+    ports:
+      - "27015:27015/tcp"
+      - "27015:27015/udp"
+      - "27020:27020/tcp"
+      - "27020:27020/udp"
+    volumes:
+      - cs2-data:/home/steam
+      - ./cs2/custom_files:/home/custom_files
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+
+  bet1v1-quake-3-js-server:
+    profiles: ["bet1v1-quake-3-js-server"]
+    image: lukaklacar/q3js-server:1.0.0
+    environment:
+      Q3JS_MASTER_URL: ${Q3JS_MASTER_URL:-https://master.q3js.com}
+      Q3JS_PUBLISH_HOST: ${Q3JS_PUBLISH_HOST:-localhost}
+      Q3JS_PUBLISH_PORT: 27961
+      Q3JS_SECURE: ${Q3JS_SECURE:-false}
+      Q3JS_SERVER_CONFIG: >-
+        seta sv_hostname "Bet 1v1 Q3JS";
+        seta sv_maxclients "2";
+        seta g_gametype "1";
+        seta fraglimit "10";
+        seta timelimit "10";
+        map q3dm17
+    ports:
+      - "27960:27960/udp"
+      - "27961:27961/tcp"
+    volumes:
+      - ./bet1v1-quake-3-js-server/baseq3:/data/baseq3:ro
+      - bet1v1-quake-3-js-server-state:/state
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  cs2-data:
+  bet1v1-quake-3-js-server-state:
