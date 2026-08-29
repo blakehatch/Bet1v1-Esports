@@ -12,13 +12,15 @@ docker compose up --build
 
 Open `http://localhost:3000`. The default `MOCK_CHAIN=true` mode lets the dapp simulate token stakes and lets the admin panel publish winner events without a Solana validator or the 60GB CS2 install. Use two Solana wallet addresses to create and accept a wager. The admin key defaults to `local-admin`.
 
+Choose Counter-Strike 2 or Quake III Arena from the arena menu before entering the wager dashboard. Challenges are kept separate by game, and matched wagers receive the corresponding configured server address.
+
 The normal stack contains:
 
 - `app` on port 3000
-- `api` on port 3001
+- `api` behind the app at `http://localhost:3000/api`
 - `worker` consuming BullMQ settlement jobs
-- `postgres` on port 5432
-- `redis` on port 6379
+- `postgres` on the private Compose network
+- `redis` on the private Compose network
 
 ## Solana program
 

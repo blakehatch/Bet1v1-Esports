@@ -41,7 +41,8 @@ app.get("/health", async () => ({ ok: true }));
 app.get("/config", async () => ({
   ...chainAddresses,
   mockChain: config.mockChain,
-  serverAddress: config.serverAddress
+  serverAddress: config.serverAddress,
+  quake3ServerAddress: config.quake3ServerAddress
 }));
 
 app.get("/access/:wallet", async (request) => {
@@ -93,7 +94,11 @@ app.post("/friends", async (request) => {
 });
 
 app.get("/wagers", async (request) => {
-  const query = z.object({ wallet: wallet.optional(), status: z.string().optional() }).parse(request.query);
+  const query = z.object({
+    wallet: wallet.optional(),
+    status: z.string().optional(),
+    game: z.enum(["CS2", "QUAKE3"]).optional()
+  }).parse(request.query);
   const values: string[] = [];
   const clauses: string[] = [];
   if (query.wallet) {
@@ -104,6 +109,10 @@ app.get("/wagers", async (request) => {
     values.push(query.status.toUpperCase());
     clauses.push(`status = $${values.length}`);
   }
+  if (query.game) {
+    values.push(query.game);
+    clauses.push(`game = $${values.length}`);
+  }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const result = await db.query(`SELECT * FROM wagers ${where} ORDER BY created_at DESC LIMIT 100`, values);
   return result.rows.map(serializeWager);
@@ -113,7 +122,8 @@ app.post("/wagers", async (request) => {
   const body = z.object({
     maker: wallet,
     challenger: wallet.nullish(),
-    amount: tokenAmount
+    amount: tokenAmount,
+    game: z.enum(["CS2", "QUAKE3"])
   }).parse(request.body);
   const access = await getAccess(body.maker);
   if (!access.active) {
@@ -134,10 +144,10 @@ app.post("/wagers", async (request) => {
     }
   }
   const result = await db.query(
-    `INSERT INTO wagers (maker, challenger, amount)
-     VALUES ($1, $2, $3)
+    `INSERT INTO wagers (maker, challenger, amount, game)
+     VALUES ($1, $2, $3, $4)
      RETURNING *`,
-    [body.maker, body.challenger ?? null, body.amount]
+    [body.maker, body.challenger ?? null, body.amount, body.game]
   );
   return serializeWager(result.rows[0]);
 });
@@ -164,14 +174,21 @@ app.post("/wagers/:wagerId/accept", async (request) => {
   }
   const result = await db.query(
     `UPDATE wagers
-     SET opponent = $2, status = 'MATCHED', server_address = $3,
-         chain_signature = COALESCE($4, chain_signature)
+     SET opponent = $2, status = 'MATCHED',
+         server_address = CASE WHEN game = 'QUAKE3' THEN $4 ELSE $3 END,
+         chain_signature = COALESCE($5, chain_signature)
      WHERE wager_id = $1
        AND status = 'OPEN'
        AND maker <> $2
        AND (challenger IS NULL OR challenger = $2)
      RETURNING *`,
-    [params.wagerId, body.opponent, config.serverAddress, body.signature ?? null]
+    [
+      params.wagerId,
+      body.opponent,
+      config.serverAddress,
+      config.quake3ServerAddress,
+      body.signature ?? null
+    ]
   );
   if (!result.rows[0]) {
     const error = new Error("Wager is unavailable") as Error & { statusCode: number };

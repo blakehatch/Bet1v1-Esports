@@ -26,7 +26,10 @@ type AppConfig = {
   tokenMint: string;
   mockChain: boolean;
   serverAddress: string;
+  quake3ServerAddress: string;
 };
+
+type Game = "CS2" | "QUAKE3";
 
 type Access = {
   amount: string;
@@ -41,78 +44,126 @@ type Wager = {
   challenger: string | null;
   opponent: string | null;
   amount: string;
+  game: Game;
   status: string;
   serverAddress: string | null;
   winner: string | null;
 };
 
-const apiUrl = import.meta.env.VITE_API_URL ?? "http://localhost:3001";
+const apiUrl = import.meta.env.VITE_API_URL ?? "/api";
 const decimals = Number(import.meta.env.VITE_TOKEN_DECIMALS ?? 9);
 const connection = new Connection(import.meta.env.VITE_SOLANA_RPC_URL ?? "http://127.0.0.1:8899", "confirmed");
 const tokenProgramId = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const associatedTokenProgramId = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 let walletAddress = "";
 let appConfig: AppConfig;
+let selectedGame: Game | null = null;
+let accessActive = false;
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
 
 root.innerHTML = `
-  <header>
-    <div class="brand">BET<span>1V1</span></div>
-    <div class="row">
-      <span class="wallet" id="wallet">Wallet disconnected</span>
-      <button id="connect">Connect wallet</button>
+  <div class="page-frame" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand-lockup" href="#" aria-label="Bet1v1 home">
+      <span class="brand-mark">1V1</span>
+      <span><strong>BET1V1</strong><small>ESPORTS PROTOCOL</small></span>
+    </a>
+    <div class="network-status"><i></i> SOLANA DEVNET</div>
+    <div class="wallet-actions">
+      <span class="wallet" id="wallet">WALLET DISCONNECTED</span>
+      <button class="connect-button" id="connect">CONNECT WALLET</button>
     </div>
   </header>
   <main>
     <section class="hero">
-      <span class="pill">P2P ARENA WAGERING</span>
-      <h1>Stake. Challenge. <span class="accent">Duke it out.</span></h1>
-      <p class="muted">Stake BET1V1 for access, escrow a wager, then settle from the verified server result.</p>
+      <div class="signal-label"><span></span>BET1V1 ESPORTS <b>PUBLIC</b><span></span></div>
+      <div class="hero-crystal" aria-hidden="true"><i></i></div>
+      <div class="hero-copy">
+        <h1><span>Bet</span><em>1v1</em></h1>
+        <div class="protocol-label"><b>P2P 1V1</b> ESPORTS WAGERING PROTOCOL</div>
+        <p>Stake $B1V1. Choose your arena. Challenge a rival.</p>
+        <div class="solana-lockup"><i><span></span><span></span><span></span></i> ON <b>SOLANA</b></div>
+      </div>
+      <div class="hero-footer"><span>WAGER P2P</span><i></i><span>1V1 DUELS</span><i></i><span>ON-CHAIN ESCROW</span><i></i><span>FAST FINALITY</span></div>
     </section>
-    <section class="grid">
-      <article class="card stack">
-        <div class="row between"><h2>Access stake</h2><span class="pill" id="access-status">LOCKED</span></div>
+
+    <section class="game-menu" id="game-menu">
+      <div class="section-kicker">01 // SELECT YOUR ARENA</div>
+      <div class="section-title-row">
+        <div><h2>Choose your game</h2><p>Your arena determines which challenges and servers you enter.</p></div>
+        <span class="menu-state" id="game-selection-state">AWAITING SELECTION</span>
+      </div>
+      <div class="game-grid">
+        <button class="game-tile cs2-tile" data-game="CS2" type="button" aria-pressed="false">
+          <span class="game-number">01</span>
+          <span class="game-art cs2-art" aria-hidden="true"><i></i></span>
+          <span class="game-info"><small>TACTICAL // BEST OF ONE</small><strong>COUNTER-STRIKE 2</strong><span>Precision aim. Zero excuses.</span></span>
+          <span class="select-arrow">ENTER ARENA <b>→</b></span>
+        </button>
+        <button class="game-tile quake-tile" data-game="QUAKE3" type="button" aria-pressed="false">
+          <span class="game-number">02</span>
+          <span class="game-art quake-art" aria-hidden="true"><i>Q</i></span>
+          <span class="game-info"><small>ARENA // FRAGLIMIT 10</small><strong>QUAKE III ARENA</strong><span>Pure movement. Pure duel.</span></span>
+          <span class="select-arrow">ENTER ARENA <b>→</b></span>
+        </button>
+      </div>
+    </section>
+
+    <section class="access-panel card">
+      <div class="access-copy">
+        <div class="section-kicker">02 // ACCESS PROTOCOL</div>
+        <div class="row between"><h2>Stake to compete</h2><span class="pill" id="access-status">LOCKED</span></div>
         <p class="muted" id="stake-copy">Connect a wallet to check access.</p>
+      </div>
+      <div class="stake-controls">
+        <label for="stake-amount">$B1V1 AMOUNT</label>
         <div class="row">
           <input id="stake-amount" type="number" min="0" step="0.000000001" value="1" aria-label="Stake amount" />
-          <button id="stake" disabled>Stake</button>
+          <button id="stake" disabled>STAKE TOKENS</button>
         </div>
-      </article>
+      </div>
     </section>
-    <div id="gated" class="hidden">
-    <section class="grid" style="margin-top: 1rem">
+
+    <div id="workspace" class="hidden arena-workspace">
+      <div class="arena-heading">
+        <div><div class="section-kicker">03 // MATCH CONTROL</div><h2 id="selected-game-title">Arena dashboard</h2></div>
+        <span class="selected-game-chip" id="selected-game-chip">NO GAME</span>
+      </div>
+    <section class="grid">
       <article class="card stack">
-        <h2>Friend list</h2>
+        <div class="card-heading"><span class="card-icon">+</span><div><small>SQUAD NETWORK</small><h3>Friend list</h3></div></div>
         <div class="row">
           <input id="friend-wallet" placeholder="Friend wallet" aria-label="Friend wallet" />
-          <button id="add-friend" disabled>Add</button>
+          <button id="add-friend" disabled>ADD</button>
         </div>
         <div id="friends" class="stack"><span class="empty">No friends yet.</span></div>
       </article>
       <article class="card stack">
-        <h2>New wager</h2>
+        <div class="card-heading"><span class="card-icon">◇</span><div><small>ON-CHAIN ESCROW</small><h3>New wager</h3></div></div>
+        <label for="wager-amount">WAGER PER PLAYER</label>
         <input id="wager-amount" type="number" min="0" step="0.000000001" value="0.1" aria-label="Wager amount" />
         <input id="challenger" placeholder="Friend wallet or blank for random" aria-label="Challenger wallet" />
-        <button id="create-wager" disabled>Create wager</button>
+        <button id="create-wager" disabled>CREATE CHALLENGE</button>
       </article>
     </section>
-    <section class="grid" style="margin-top: 1rem">
+    <section class="grid section-space">
       <article class="card">
-        <div class="row between"><h2>Open challenges</h2><button class="secondary" id="refresh">Refresh</button></div>
+        <div class="row between"><div class="card-heading"><span class="live-dot"></span><div><small>LIVE BOARD</small><h3>Open challenges</h3></div></div><button class="secondary compact" id="refresh">REFRESH</button></div>
         <div id="open-wagers"><span class="empty">No open wagers.</span></div>
       </article>
       <article class="card">
-        <h2>Your matches</h2>
+        <div class="card-heading"><span class="card-icon">×</span><div><small>PLAYER RECORD</small><h3>Your matches</h3></div></div>
         <div id="my-wagers"><span class="empty">Connect a wallet.</span></div>
       </article>
     </section>
-    <section class="card" style="margin-top: 1rem">
-      <div class="row between"><div><h2>Admin match simulator</h2><p class="muted">Publish a signed-off winner event without installing a game server.</p></div><input id="admin-key" value="local-admin" aria-label="Admin key" style="max-width: 14rem" /></div>
+    <section class="card admin-card section-space">
+      <div class="row between"><div><div class="section-kicker">DEV CONTROL</div><h3>Admin match simulator</h3><p class="muted">Publish a verified winner event without installing a game server.</p></div><input id="admin-key" value="local-admin" aria-label="Admin key" /></div>
       <div id="admin-wagers"><span class="empty">No matched wagers.</span></div>
     </section>
     </div>
   </main>
+  <footer><span>BET1V1 // PUBLIC BUILD</span><span>POWERED BY SOLANA</span></footer>
   <div id="notice" class="hidden"></div>
 `;
 
@@ -145,6 +196,8 @@ const displayAmount = (value: string) => {
   const unit = 10 ** decimals;
   return (Number(value) / unit).toLocaleString(undefined, { maximumFractionDigits: decimals });
 };
+
+const gameName = (game: Game) => game === "CS2" ? "Counter-Strike 2" : "Quake III Arena";
 
 const u64 = (value: bigint) => {
   const bytes = new Uint8Array(8);
@@ -265,7 +318,8 @@ const joinWagerOnChain = async (wager: Wager) => {
 
 const renderWager = (wager: Wager, action = "") => `
   <div class="wager">
-    <div class="row between"><strong>#${wager.wagerId} · ${displayAmount(wager.amount)} BET1V1 each</strong><span class="pill">${wager.status}</span></div>
+    <div class="row between"><strong>#${wager.wagerId} · ${displayAmount(wager.amount)} $B1V1 EACH</strong><span class="pill">${wager.status}</span></div>
+    <span class="game-tag">${wager.game === "CS2" ? "CS2" : "QUAKE III"}</span>
     <span class="muted">${wager.maker.slice(0, 8)}… vs ${wager.opponent ? `${wager.opponent.slice(0, 8)}…` : "waiting"}</span>
     ${wager.winner ? `<span class="accent">Winner ${wager.winner.slice(0, 12)}…</span>` : ""}
     ${action}
@@ -275,12 +329,13 @@ const renderWager = (wager: Wager, action = "") => `
 const refreshAccess = async () => {
   if (!walletAddress) return;
   const access = await api<Access>(`/access/${walletAddress}`);
+  accessActive = access.active && !access.banned;
   element("access-status").textContent = access.banned ? "BANNED" : access.active ? "ACTIVE" : "LOCKED";
   element("stake-copy").textContent = `${displayAmount(access.amount)} staked · ${displayAmount(access.requiredStake)} required`;
-  element("gated").classList.toggle("hidden", !access.active);
   element<HTMLButtonElement>("stake").disabled = access.banned;
-  element<HTMLButtonElement>("create-wager").disabled = !access.active;
-  element<HTMLButtonElement>("add-friend").disabled = !access.active;
+  element<HTMLButtonElement>("create-wager").disabled = !accessActive || !selectedGame;
+  element<HTMLButtonElement>("add-friend").disabled = !accessActive || !selectedGame;
+  element("workspace").classList.toggle("access-locked", !accessActive);
 };
 
 const refreshFriends = async () => {
@@ -292,18 +347,25 @@ const refreshFriends = async () => {
 };
 
 const refreshWagers = async () => {
-  const open = await api<Wager[]>("/wagers?status=OPEN");
+  if (!selectedGame) return;
+  const gameQuery = `game=${selectedGame}`;
+  const open = await api<Wager[]>(`/wagers?status=OPEN&${gameQuery}`);
   element("open-wagers").innerHTML = open.length
     ? open.map((wager) => {
         const available = walletAddress && wager.maker !== walletAddress && (!wager.challenger || wager.challenger === walletAddress);
         return renderWager(wager, available ? `<button data-join="${wager.wagerId}">Accept</button>` : "");
       }).join("")
     : `<span class="empty">No open wagers.</span>`;
-  const mine = walletAddress ? await api<Wager[]>(`/wagers?wallet=${walletAddress}`) : [];
+  const mine = walletAddress ? await api<Wager[]>(`/wagers?wallet=${walletAddress}&${gameQuery}`) : [];
   element("my-wagers").innerHTML = mine.length
-    ? mine.map((wager) => renderWager(wager, wager.status === "MATCHED" && wager.serverAddress ? `<button data-connect="${wager.serverAddress}">Connect to CS2</button>` : "")).join("")
+    ? mine.map((wager) => renderWager(
+        wager,
+        wager.status === "MATCHED" && wager.serverAddress
+          ? `<button data-connect="${wager.serverAddress}" data-connect-game="${wager.game}">${wager.game === "CS2" ? "CONNECT TO CS2" : "OPEN QUAKE SERVER"}</button>`
+          : ""
+      )).join("")
     : `<span class="empty">No matches yet.</span>`;
-  const matched = await api<Wager[]>("/wagers?status=MATCHED");
+  const matched = await api<Wager[]>(`/wagers?status=MATCHED&${gameQuery}`);
   element("admin-wagers").innerHTML = matched.length
     ? matched.map((wager) => renderWager(wager, `<div class="row"><button data-winner-id="${wager.wagerId}" data-winner="${wager.maker}">Maker won</button><button class="secondary" data-winner-id="${wager.wagerId}" data-winner="${wager.opponent}">Opponent won</button></div>`)).join("")
     : `<span class="empty">No matched wagers.</span>`;
@@ -349,9 +411,13 @@ element("add-friend").addEventListener("click", async () => {
 
 element("create-wager").addEventListener("click", async () => {
   try {
+    if (!selectedGame) throw new Error("Select a game first");
     const challenger = element<HTMLInputElement>("challenger").value.trim() || null;
     const amount = rawAmount(element<HTMLInputElement>("wager-amount").value).toString();
-    const wager = await api<Wager>("/wagers", { method: "POST", body: JSON.stringify({ maker: walletAddress, challenger, amount }) });
+    const wager = await api<Wager>("/wagers", {
+      method: "POST",
+      body: JSON.stringify({ maker: walletAddress, challenger, amount, game: selectedGame })
+    });
     if (!appConfig.mockChain) {
       const signature = await createWagerOnChain(wager);
       await api(`/wagers/${wager.wagerId}/chain`, { method: "POST", body: JSON.stringify({ maker: walletAddress, signature }) });
@@ -367,10 +433,11 @@ document.addEventListener("click", async (event) => {
   const target = event.target as HTMLElement;
   const joinId = target.dataset.join;
   const server = target.dataset.connect;
+  const connectGame = target.dataset.connectGame as Game | undefined;
   const winnerId = target.dataset.winnerId;
   try {
     if (joinId) {
-      const wagers = await api<Wager[]>(`/wagers?status=OPEN`);
+      const wagers = await api<Wager[]>(`/wagers?status=OPEN&game=${selectedGame}`);
       const wager = wagers.find((item) => item.wagerId === joinId);
       if (!wager) throw new Error("Wager is unavailable");
       const signature = appConfig.mockChain ? undefined : await joinWagerOnChain(wager);
@@ -379,7 +446,11 @@ document.addEventListener("click", async (event) => {
       notice("Wager accepted");
     }
     if (server) {
-      window.location.href = `steam://connect/${server}`;
+      if (connectGame === "QUAKE3") {
+        window.open(`http://${server}`, "_blank", "noopener,noreferrer");
+      } else {
+        window.location.href = `steam://connect/${server}`;
+      }
     }
     if (winnerId) {
       await api("/admin/winners", {
@@ -397,10 +468,33 @@ document.addEventListener("click", async (event) => {
 
 element("refresh").addEventListener("click", refreshWagers);
 
+document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    selectedGame = button.dataset.game as Game;
+    document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((tile) => {
+      const active = tile === button;
+      tile.classList.toggle("selected", active);
+      tile.setAttribute("aria-pressed", String(active));
+    });
+    element("game-selection-state").textContent = `${gameName(selectedGame)} selected`;
+    element("selected-game-title").textContent = `${gameName(selectedGame)} dashboard`;
+    element("selected-game-chip").textContent = selectedGame === "CS2" ? "CS2 // ACTIVE" : "Q3 // ACTIVE";
+    element("workspace").classList.remove("hidden");
+    element("workspace").classList.toggle("access-locked", !accessActive);
+    element<HTMLButtonElement>("create-wager").disabled = !accessActive;
+    element<HTMLButtonElement>("add-friend").disabled = !accessActive;
+    try {
+      await refreshWagers();
+      element("workspace").scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (error) {
+      notice(error instanceof Error ? error.message : "Unable to load arena");
+    }
+  });
+});
+
 const start = async () => {
   try {
     appConfig = await api<AppConfig>("/config");
-    await refreshWagers();
   } catch (error) {
     notice(error instanceof Error ? error.message : "API unavailable");
   }

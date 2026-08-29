@@ -21,5 +21,6 @@ export const config = {
   adminKey: required("ADMIN_KEY", "local-admin"),
   winnerChannel: "cs2:winners",
   queueName: "chain-actions",
-  serverAddress: process.env.CS2_SERVER_ADDRESS ?? "127.0.0.1:27015"
+  serverAddress: process.env.CS2_SERVER_ADDRESS ?? "127.0.0.1:27015",
+  quake3ServerAddress: process.env.QUAKE3_SERVER_ADDRESS ?? "127.0.0.1:27961"
 };
