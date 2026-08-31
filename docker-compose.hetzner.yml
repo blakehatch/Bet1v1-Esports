@@ -21,6 +21,7 @@ services:
 
   bet1v1-quake-3-js-server:
     environment:
+      Q3JS_MASTER_URL: ${Q3JS_MASTER_URL:-https://master.q3js.com}
       Q3JS_EVENT_CLIENT_SECRET: ${Q3JS_EVENT_CLIENT_SECRET:?Set Q3JS_EVENT_CLIENT_SECRET in .env}
       Q3JS_PUBLISH_HOST: ${Q3_DOMAIN:?Set Q3_DOMAIN in .env}
       Q3JS_PUBLISH_PORT: 443
