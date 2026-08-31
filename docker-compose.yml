@@ -117,6 +117,7 @@ services:
       Q3JS_PUBLISH_PORT: ${Q3JS_PUBLISH_PORT:-27961}
       Q3JS_SECURE: ${Q3JS_SECURE:-false}
       Q3JS_SERVER_CONFIG: >-
+        sets fs_game "q3js";
         seta sv_hostname "Bet 1v1 Q3JS";
         seta sv_maxclients "2";
         seta g_gametype "1";
