@@ -13,21 +13,21 @@ pub struct InvalidateWager<'info> {
         seeds = [seeds::WAGER, &wager.wager_id.to_le_bytes()],
         bump = wager.bump
     )]
-    pub wager: Account<'info, Wager>,
+    pub wager: Box<Account<'info, Wager>>,
     #[account(
         mut,
         seeds = [seeds::STAKE, wager.maker.as_ref()],
         bump = maker_stake.bump,
         constraint = maker_stake.owner == wager.maker
     )]
-    pub maker_stake: Account<'info, UserStake>,
+    pub maker_stake: Box<Account<'info, UserStake>>,
     #[account(
         mut,
         seeds = [seeds::STAKE, wager.opponent.as_ref()],
         bump = opponent_stake.bump,
         constraint = opponent_stake.owner == wager.opponent
     )]
-    pub opponent_stake: Account<'info, UserStake>,
+    pub opponent_stake: Box<Account<'info, UserStake>>,
     #[account(
         mut,
         seeds = [seeds::WAGER_VAULT, &wager.wager_id.to_le_bytes()],
@@ -35,7 +35,7 @@ pub struct InvalidateWager<'info> {
         token::mint = token_mint,
         token::authority = wager
     )]
-    pub wager_vault: Account<'info, TokenAccount>,
+    pub wager_vault: Box<Account<'info, TokenAccount>>,
     #[account(address = config.token_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
@@ -43,13 +43,13 @@ pub struct InvalidateWager<'info> {
         token::mint = token_mint,
         constraint = maker_token.owner == wager.maker
     )]
-    pub maker_token: Account<'info, TokenAccount>,
+    pub maker_token: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         token::mint = token_mint,
         constraint = opponent_token.owner == wager.opponent
     )]
-    pub opponent_token: Account<'info, TokenAccount>,
+    pub opponent_token: Box<Account<'info, TokenAccount>>,
     pub signer: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
@@ -66,16 +66,21 @@ pub fn invalidate_wager(ctx: Context<InvalidateWager>) -> Result<()> {
     );
     let wager_id = ctx.accounts.wager.wager_id.to_le_bytes();
     let signer_seeds: &[&[u8]] = &[seeds::WAGER, &wager_id, &[ctx.accounts.wager.bump]];
-    for (from, to) in [
+    for (from, to, amount) in [
         (
             ctx.accounts.wager_vault.to_account_info(),
             ctx.accounts.maker_token.to_account_info(),
+            ctx.accounts.wager.maker_remaining,
         ),
         (
             ctx.accounts.wager_vault.to_account_info(),
             ctx.accounts.opponent_token.to_account_info(),
+            ctx.accounts.wager.opponent_remaining,
         ),
     ] {
+        if amount == 0 {
+            continue;
+        }
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -86,10 +91,12 @@ pub fn invalidate_wager(ctx: Context<InvalidateWager>) -> Result<()> {
                 },
                 &[signer_seeds],
             ),
-            ctx.accounts.wager.amount,
+            amount,
         )?;
     }
     ctx.accounts.wager.status = CANCELLED;
+    ctx.accounts.wager.maker_remaining = 0;
+    ctx.accounts.wager.opponent_remaining = 0;
     ctx.accounts.maker_stake.active_wagers = ctx
         .accounts
         .maker_stake

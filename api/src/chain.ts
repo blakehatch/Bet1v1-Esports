@@ -34,6 +34,12 @@ const u64 = (value: bigint) => {
   return data;
 };
 
+const u32 = (value: number) => {
+  const data = Buffer.alloc(4);
+  data.writeUInt32LE(value);
+  return data;
+};
+
 const walletKeypair = () => {
   if (!config.chainAuthoritySecret) {
     throw new Error("CHAIN_AUTHORITY_SECRET is required when MOCK_CHAIN=false");
@@ -149,6 +155,64 @@ export const settleWager = async (wagerId: string, winnerAddress: string) => {
   return sendAndConfirmTransaction(connection, transaction, [chainAuthority], {
     commitment: "confirmed"
   });
+};
+
+export const settleKill = async (wagerId: string, killerAddress: string, sequence: number) => {
+  if (config.mockChain) return `mock-kill-${sequence}-${randomUUID()}`;
+  const chainAuthority = walletKeypair();
+  const wagerIdBytes = u64(BigInt(wagerId));
+  const [configAddress] = PublicKey.findProgramAddressSync([Buffer.from("config")], programId);
+  const [wagerAddress] = PublicKey.findProgramAddressSync([Buffer.from("wager"), wagerIdBytes], programId);
+  const [wagerVault] = PublicKey.findProgramAddressSync([Buffer.from("wager_vault"), wagerIdBytes], programId);
+  const wagerResult = await db.query(
+    "SELECT maker, opponent FROM wagers WHERE wager_id = $1",
+    [wagerId]
+  );
+  const wager = wagerResult.rows[0] as { maker: string; opponent: string } | undefined;
+  if (!wager?.opponent) throw new Error("Matched wager not found");
+  if (killerAddress !== wager.maker && killerAddress !== wager.opponent) {
+    throw new Error("Killer is not a wager participant");
+  }
+  const maker = new PublicKey(wager.maker);
+  const opponent = new PublicKey(wager.opponent);
+  const [makerStake] = PublicKey.findProgramAddressSync([Buffer.from("stake"), maker.toBuffer()], programId);
+  const [opponentStake] = PublicKey.findProgramAddressSync([Buffer.from("stake"), opponent.toBuffer()], programId);
+  const makerToken = associatedTokenAddress(maker);
+  const opponentToken = associatedTokenAddress(opponent);
+  const transaction = new Transaction();
+  for (const [owner, token] of [[maker, makerToken], [opponent, opponentToken]] as const) {
+    if (!(await connection.getAccountInfo(token))) {
+      transaction.add(new TransactionInstruction({
+        programId: associatedTokenProgramId,
+        data: Buffer.alloc(0),
+        keys: [
+          { pubkey: chainAuthority.publicKey, isSigner: true, isWritable: true },
+          { pubkey: token, isSigner: false, isWritable: true },
+          { pubkey: owner, isSigner: false, isWritable: false },
+          { pubkey: tokenMint, isSigner: false, isWritable: false },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          { pubkey: tokenProgramId, isSigner: false, isWritable: false }
+        ]
+      }));
+    }
+  }
+  transaction.add(new TransactionInstruction({
+    programId,
+    data: Buffer.concat([discriminator("settle_kill"), new PublicKey(killerAddress).toBuffer(), u32(sequence)]),
+    keys: [
+      { pubkey: configAddress, isSigner: false, isWritable: false },
+      { pubkey: wagerAddress, isSigner: false, isWritable: true },
+      { pubkey: makerStake, isSigner: false, isWritable: true },
+      { pubkey: opponentStake, isSigner: false, isWritable: true },
+      { pubkey: wagerVault, isSigner: false, isWritable: true },
+      { pubkey: tokenMint, isSigner: false, isWritable: false },
+      { pubkey: makerToken, isSigner: false, isWritable: true },
+      { pubkey: opponentToken, isSigner: false, isWritable: true },
+      { pubkey: chainAuthority.publicKey, isSigner: true, isWritable: false },
+      { pubkey: tokenProgramId, isSigner: false, isWritable: false }
+    ]
+  }));
+  return sendAndConfirmTransaction(connection, transaction, [chainAuthority], { commitment: "confirmed" });
 };
 
 export const chainAddresses = {

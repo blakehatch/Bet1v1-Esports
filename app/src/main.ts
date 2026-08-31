@@ -12,6 +12,7 @@ import { Buffer } from "buffer";
 type Phantom = {
   publicKey?: PublicKey;
   connect: () => Promise<{ publicKey: PublicKey }>;
+  signMessage: (message: Uint8Array, display?: "utf8" | "hex") => Promise<{ signature: Uint8Array }>;
   signAndSendTransaction: (transaction: Transaction) => Promise<{ signature: string }>;
 };
 
@@ -48,6 +49,14 @@ type Wager = {
   status: string;
   serverAddress: string | null;
   winner: string | null;
+  payoutMode: "WINNER_TAKE_ALL" | "PER_KILL";
+  fragLimit: number;
+  killValue: string;
+  makerRemaining: string;
+  opponentRemaining: string;
+  makerScore: number;
+  opponentScore: number;
+  quake3Identity?: { playerName: string; playUrl: string };
 };
 
 const apiUrl = import.meta.env.VITE_API_URL ?? "/api";
@@ -59,6 +68,7 @@ let walletAddress = "";
 let appConfig: AppConfig;
 let selectedGame: Game | null = null;
 let accessActive = false;
+let authToken = "";
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -143,6 +153,15 @@ root.innerHTML = `
         <div class="card-heading"><span class="card-icon">◇</span><div><small>ON-CHAIN ESCROW</small><h3>New wager</h3></div></div>
         <label for="wager-amount">WAGER PER PLAYER</label>
         <input id="wager-amount" type="number" min="0" step="0.000000001" value="0.1" aria-label="Wager amount" />
+        <label for="payout-mode">PAYOUT MODE</label>
+        <select id="payout-mode" aria-label="Payout mode">
+          <option value="WINNER_TAKE_ALL">Winner takes the match pot</option>
+          <option value="PER_KILL">Configurable payout per kill</option>
+        </select>
+        <label for="frag-limit">Q3 FRAG LIMIT (MATCH MODE)</label>
+        <input id="frag-limit" type="number" min="1" max="100" step="1" value="10" aria-label="Quake frag limit" />
+        <label for="kill-value">$B1V1 PER KILL</label>
+        <input id="kill-value" type="number" min="0" step="0.000000001" value="0.005" aria-label="Per kill amount" disabled />
         <input id="challenger" placeholder="Friend wallet or blank for random" aria-label="Challenger wallet" />
         <button id="create-wager" disabled>CREATE CHALLENGE</button>
       </article>
@@ -178,7 +197,11 @@ const notice = (message: string) => {
 const api = async <T>(path: string, init?: RequestInit) => {
   const response = await fetch(`${apiUrl}${path}`, {
     ...init,
-    headers: { "content-type": "application/json", ...init?.headers }
+    headers: {
+      "content-type": "application/json",
+      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      ...init?.headers
+    }
   });
   const body = await response.json() as T & { error?: string };
   if (!response.ok) {
@@ -198,6 +221,15 @@ const displayAmount = (value: string) => {
 };
 
 const gameName = (game: Game) => game === "CS2" ? "Counter-Strike 2" : "Quake III Arena";
+const identityKey = (wagerId: string) => `bet1v1:q3:${walletAddress}:${wagerId}`;
+const rememberIdentity = (wager: Wager) => {
+  if (wager.quake3Identity) localStorage.setItem(identityKey(wager.wagerId), JSON.stringify(wager.quake3Identity));
+};
+const playUrl = (wagerId: string) => {
+  const value = localStorage.getItem(identityKey(wagerId));
+  if (!value) return undefined;
+  try { return (JSON.parse(value) as { playUrl?: string }).playUrl; } catch { return undefined; }
+};
 
 const u64 = (value: bigint) => {
   const bytes = new Uint8Array(8);
@@ -230,6 +262,18 @@ const provider = () => {
     throw new Error("Install a Solana wallet extension");
   }
   return window.solana;
+};
+
+const authenticate = async () => {
+  const wallet = provider();
+  if (!wallet.signMessage) throw new Error("This wallet does not support message signing");
+  const challenge = await api<{ nonce: string; message: string }>(`/auth/challenge/${walletAddress}`);
+  const signed = await wallet.signMessage(new TextEncoder().encode(challenge.message), "utf8");
+  const session = await api<{ token: string }>("/auth/verify", {
+    method: "POST",
+    body: JSON.stringify({ wallet: walletAddress, nonce: challenge.nonce, signature: Array.from(signed.signature) })
+  });
+  authToken = session.token;
 };
 
 const send = async (instruction: TransactionInstruction) => {
@@ -279,7 +323,13 @@ const createWagerOnChain = async (wager: Wager) => {
   const id = u64(BigInt(wager.wagerId));
   return send(new TransactionInstruction({
     programId,
-    data: await instructionData("create_wager", [id, challenger.toBytes(), u64(BigInt(wager.amount))]),
+    data: await instructionData("create_wager", [
+      id,
+      challenger.toBytes(),
+      u64(BigInt(wager.amount)),
+      Uint8Array.of(wager.payoutMode === "PER_KILL" ? 1 : 0),
+      u64(BigInt(wager.killValue))
+    ]),
     keys: [
       { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
       { pubkey: pda([new TextEncoder().encode("stake"), maker.toBytes()], programId), isSigner: false, isWritable: true },
@@ -320,6 +370,8 @@ const renderWager = (wager: Wager, action = "") => `
   <div class="wager">
     <div class="row between"><strong>#${wager.wagerId} · ${displayAmount(wager.amount)} $B1V1 EACH</strong><span class="pill">${wager.status}</span></div>
     <span class="game-tag">${wager.game === "CS2" ? "CS2" : "QUAKE III"}</span>
+    <span class="muted">${wager.payoutMode === "PER_KILL" ? `${displayAmount(wager.killValue)} $B1V1 / kill · bankroll ${displayAmount(wager.amount)} each` : `winner takes all · fraglimit ${wager.fragLimit}`}</span>
+    ${wager.game === "QUAKE3" && wager.status !== "OPEN" ? `<span class="muted">score ${wager.makerScore}–${wager.opponentScore}</span>` : ""}
     <span class="muted">${wager.maker.slice(0, 8)}… vs ${wager.opponent ? `${wager.opponent.slice(0, 8)}…` : "waiting"}</span>
     ${wager.winner ? `<span class="accent">Winner ${wager.winner.slice(0, 12)}…</span>` : ""}
     ${action}
@@ -361,7 +413,9 @@ const refreshWagers = async () => {
     ? mine.map((wager) => renderWager(
         wager,
         wager.status === "MATCHED" && wager.serverAddress
-          ? `<button data-connect="${wager.serverAddress}" data-connect-game="${wager.game}">${wager.game === "CS2" ? "CONNECT TO CS2" : "OPEN QUAKE SERVER"}</button>`
+          ? wager.game === "QUAKE3"
+            ? `<button data-q3-wager="${wager.wagerId}" ${playUrl(wager.wagerId) ? "" : "disabled"}>PLAY QUAKE III</button>`
+            : `<button data-connect="${wager.serverAddress}" data-connect-game="${wager.game}">CONNECT TO CS2</button>`
           : ""
       )).join("")
     : `<span class="empty">No matches yet.</span>`;
@@ -375,6 +429,7 @@ element("connect").addEventListener("click", async () => {
   try {
     const result = await provider().connect();
     walletAddress = result.publicKey.toBase58();
+    await authenticate();
     element("wallet").textContent = walletAddress;
     await Promise.all([refreshAccess(), refreshFriends(), refreshWagers()]);
   } catch (error) {
@@ -414,10 +469,16 @@ element("create-wager").addEventListener("click", async () => {
     if (!selectedGame) throw new Error("Select a game first");
     const challenger = element<HTMLInputElement>("challenger").value.trim() || null;
     const amount = rawAmount(element<HTMLInputElement>("wager-amount").value).toString();
+    const payoutMode = element<HTMLSelectElement>("payout-mode").value as Wager["payoutMode"];
+    const killValue = payoutMode === "PER_KILL"
+      ? rawAmount(element<HTMLInputElement>("kill-value").value).toString()
+      : "0";
+    const fragLimit = Number(element<HTMLInputElement>("frag-limit").value);
     const wager = await api<Wager>("/wagers", {
       method: "POST",
-      body: JSON.stringify({ maker: walletAddress, challenger, amount, game: selectedGame })
+      body: JSON.stringify({ maker: walletAddress, challenger, amount, game: selectedGame, payoutMode, killValue, fragLimit })
     });
+    rememberIdentity(wager);
     if (!appConfig.mockChain) {
       const signature = await createWagerOnChain(wager);
       await api(`/wagers/${wager.wagerId}/chain`, { method: "POST", body: JSON.stringify({ maker: walletAddress, signature }) });
@@ -434,6 +495,7 @@ document.addEventListener("click", async (event) => {
   const joinId = target.dataset.join;
   const server = target.dataset.connect;
   const connectGame = target.dataset.connectGame as Game | undefined;
+  const q3WagerId = target.dataset.q3Wager;
   const winnerId = target.dataset.winnerId;
   try {
     if (joinId) {
@@ -441,9 +503,15 @@ document.addEventListener("click", async (event) => {
       const wager = wagers.find((item) => item.wagerId === joinId);
       if (!wager) throw new Error("Wager is unavailable");
       const signature = appConfig.mockChain ? undefined : await joinWagerOnChain(wager);
-      await api(`/wagers/${joinId}/accept`, { method: "POST", body: JSON.stringify({ opponent: walletAddress, signature }) });
+      const accepted = await api<Wager>(`/wagers/${joinId}/accept`, { method: "POST", body: JSON.stringify({ opponent: walletAddress, signature }) });
+      rememberIdentity(accepted);
       await refreshWagers();
       notice("Wager accepted");
+    }
+    if (q3WagerId) {
+      const url = playUrl(q3WagerId);
+      if (!url) throw new Error("This browser does not hold the private Quake identity for that wager");
+      window.open(url, "_blank", "noopener,noreferrer");
     }
     if (server) {
       if (connectGame === "QUAKE3") {
@@ -467,6 +535,11 @@ document.addEventListener("click", async (event) => {
 });
 
 element("refresh").addEventListener("click", refreshWagers);
+
+element("payout-mode").addEventListener("change", () => {
+  const perKill = element<HTMLSelectElement>("payout-mode").value === "PER_KILL";
+  element<HTMLInputElement>("kill-value").disabled = !perKill;
+});
 
 document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((button) => {
   button.addEventListener("click", async () => {

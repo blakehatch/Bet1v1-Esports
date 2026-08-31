@@ -8,7 +8,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("8rqv4B1Sw4xweu4kWEHGnqoTQbQvRKuxSturDsz32i4v");
+declare_id!("6L4UuN5zYFaZsLffmUuNKk9d5BtzusyK1xE5Z8Wr2CUY");
 
 #[program]
 pub mod bet1v1_solana_program {
@@ -40,8 +40,10 @@ pub mod bet1v1_solana_program {
         wager_id: u64,
         challenger: Pubkey,
         amount: u64,
+        payout_mode: u8,
+        kill_value: u64,
     ) -> Result<()> {
-        instructions::create_wager(ctx, wager_id, challenger, amount)
+        instructions::create_wager(ctx, wager_id, challenger, amount, payout_mode, kill_value)
     }
 
     pub fn join_wager(ctx: Context<JoinWager>) -> Result<()> {
@@ -54,6 +56,10 @@ pub mod bet1v1_solana_program {
 
     pub fn settle_wager(ctx: Context<SettleWager>) -> Result<()> {
         instructions::settle_wager(ctx)
+    }
+
+    pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> Result<()> {
+        instructions::settle_kill(ctx, killer, sequence)
     }
 
     pub fn invalidate_wager(ctx: Context<InvalidateWager>) -> Result<()> {

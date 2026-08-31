@@ -1,4 +1,4 @@
-use crate::constant::{seeds, CANCELLED, OPEN};
+use crate::constant::{seeds, CANCELLED, OPEN, PER_KILL, WINNER_TAKE_ALL};
 use crate::errors::WagerError;
 use crate::event::WagerCreatedEvent;
 use crate::state::{Config, UserStake, Wager};
@@ -54,8 +54,19 @@ pub fn create_wager(
     wager_id: u64,
     challenger: Pubkey,
     amount: u64,
+    payout_mode: u8,
+    kill_value: u64,
 ) -> Result<()> {
     require!(amount > 0, WagerError::InvalidWagerAmount);
+    require!(
+        payout_mode == WINNER_TAKE_ALL || payout_mode == PER_KILL,
+        WagerError::InvalidPayoutMode
+    );
+    require!(
+        (payout_mode == WINNER_TAKE_ALL && kill_value == 0)
+            || (payout_mode == PER_KILL && kill_value > 0 && kill_value <= amount),
+        WagerError::InvalidKillValue
+    );
     require!(!ctx.accounts.maker_stake.banned, WagerError::UserBanned);
     require!(
         ctx.accounts.maker_stake.amount >= ctx.accounts.config.required_stake,
@@ -81,6 +92,12 @@ pub fn create_wager(
     wager.token_mint = ctx.accounts.token_mint.key();
     wager.winner = Pubkey::default();
     wager.status = OPEN;
+    wager.payout_mode = payout_mode;
+    wager.kill_value = kill_value;
+    wager.maker_remaining = amount;
+    wager.opponent_remaining = amount;
+    wager.maker_kills = 0;
+    wager.opponent_kills = 0;
     wager.bump = ctx.bumps.wager;
     ctx.accounts.maker_stake.active_wagers = ctx
         .accounts
@@ -93,6 +110,8 @@ pub fn create_wager(
         maker: wager.maker,
         challenger,
         amount,
+        payout_mode,
+        kill_value,
     });
     Ok(())
 }

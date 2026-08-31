@@ -1,0 +1,12 @@
+{
+	email {$ACME_EMAIL:}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:80
+}
+
+{$Q3_DOMAIN} {
+	reverse_proxy bet1v1-quake-3-js-server:27961
+}

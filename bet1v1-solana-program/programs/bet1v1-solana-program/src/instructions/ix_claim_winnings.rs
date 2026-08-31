@@ -1,4 +1,4 @@
-use crate::constant::{seeds, MATCHED, SETTLED};
+use crate::constant::{seeds, MATCHED, SETTLED, WINNER_TAKE_ALL};
 use crate::errors::WagerError;
 use crate::event::WagerSettledEvent;
 use crate::state::{Config, UserStake, Wager};
@@ -60,6 +60,10 @@ pub fn settle_wager(ctx: Context<SettleWager>) -> Result<()> {
         WagerError::WagerNotMatched
     );
     require!(
+        ctx.accounts.wager.payout_mode == WINNER_TAKE_ALL,
+        WagerError::InvalidPayoutMode
+    );
+    require!(
         ctx.accounts.winner.key() == ctx.accounts.wager.maker
             || ctx.accounts.winner.key() == ctx.accounts.wager.opponent,
         WagerError::InvalidWagerWinner
@@ -86,6 +90,8 @@ pub fn settle_wager(ctx: Context<SettleWager>) -> Result<()> {
     )?;
     ctx.accounts.wager.winner = ctx.accounts.winner.key();
     ctx.accounts.wager.status = SETTLED;
+    ctx.accounts.wager.maker_remaining = 0;
+    ctx.accounts.wager.opponent_remaining = 0;
     ctx.accounts.maker_stake.active_wagers = ctx
         .accounts
         .maker_stake

@@ -6,6 +6,8 @@ pub struct WagerCreatedEvent {
     pub maker: Pubkey,
     pub challenger: Pubkey,
     pub amount: u64,
+    pub payout_mode: u8,
+    pub kill_value: u64,
 }
 
 #[event]
@@ -20,6 +22,16 @@ pub struct WagerSettledEvent {
     pub wager_id: u64,
     pub winner: Pubkey,
     pub payout: u64,
+}
+
+#[event]
+pub struct KillPaidEvent {
+    pub wager_id: u64,
+    pub killer: Pubkey,
+    pub victim: Pubkey,
+    pub amount: u64,
+    pub sequence: u32,
+    pub settled: bool,
 }
 
 #[event]

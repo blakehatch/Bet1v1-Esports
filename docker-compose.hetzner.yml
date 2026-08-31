@@ -1,0 +1,52 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+  api:
+    environment:
+      DATABASE_URL: postgres://bet1v1:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/bet1v1
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY in .env}
+      Q3JS_EVENT_CLIENT_SECRET: ${Q3JS_EVENT_CLIENT_SECRET:?Set Q3JS_EVENT_CLIENT_SECRET in .env}
+      QUAKE3_SERVER_ADDRESS: ${Q3_DOMAIN:?Set Q3_DOMAIN in .env}:443
+      Q3JS_SECURE: "true"
+
+  worker:
+    environment:
+      DATABASE_URL: postgres://bet1v1:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/bet1v1
+      ADMIN_KEY: ${ADMIN_KEY:?Set ADMIN_KEY in .env}
+      Q3JS_EVENT_CLIENT_SECRET: ${Q3JS_EVENT_CLIENT_SECRET:?Set Q3JS_EVENT_CLIENT_SECRET in .env}
+      QUAKE3_SERVER_ADDRESS: ${Q3_DOMAIN:?Set Q3_DOMAIN in .env}:443
+      Q3JS_SECURE: "true"
+
+  bet1v1-quake-3-js-server:
+    environment:
+      Q3JS_EVENT_CLIENT_SECRET: ${Q3JS_EVENT_CLIENT_SECRET:?Set Q3JS_EVENT_CLIENT_SECRET in .env}
+      Q3JS_PUBLISH_HOST: ${Q3_DOMAIN:?Set Q3_DOMAIN in .env}
+      Q3JS_PUBLISH_PORT: 443
+      Q3JS_SECURE: "true"
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN in .env}
+      Q3_DOMAIN: ${Q3_DOMAIN:?Set Q3_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_started
+      bet1v1-quake-3-js-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  caddy-data:
+  caddy-config:

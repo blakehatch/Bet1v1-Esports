@@ -34,4 +34,10 @@ pub enum WagerError {
     WagerReserved,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Invalid payout mode")]
+    InvalidPayoutMode,
+    #[msg("Invalid per-kill value")]
+    InvalidKillValue,
+    #[msg("Invalid kill sequence")]
+    InvalidKillSequence,
 }

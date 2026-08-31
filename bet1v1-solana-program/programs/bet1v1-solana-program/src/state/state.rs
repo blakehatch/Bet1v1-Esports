@@ -21,5 +21,11 @@ pub struct Wager {
     pub token_mint: Pubkey,
     pub winner: Pubkey,
     pub status: u8,
+    pub payout_mode: u8,
+    pub kill_value: u64,
+    pub maker_remaining: u64,
+    pub opponent_remaining: u64,
+    pub maker_kills: u32,
+    pub opponent_kills: u32,
     pub bump: u8,
 }
