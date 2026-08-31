@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { z } from "zod";
 import { config } from "./config.js";
@@ -74,7 +74,15 @@ export const quake3PlayUrl = (playerName: string) => {
   url.searchParams.set("secure", config.quake3Secure ? "1" : "0");
   url.searchParams.set("baseGame", "baseq3");
   url.searchParams.set("comGameName", "Quake3Arena");
-  url.searchParams.set("serverName", "Bet1v1");
+  url.searchParams.set("serverName", "Bet 1v1 Q3JS");
   url.searchParams.set("name", playerName);
+  url.searchParams.set("serverMode", "Tournament");
+  url.searchParams.set("serverMap", "q3dm17");
+  url.searchParams.set("official", "0");
+  url.searchParams.set("humanPlayers", "0");
+  url.searchParams.set("entryPoint", "bet1v1_wager");
+  url.searchParams.set("handoffId", randomUUID());
+  url.searchParams.set("voice", "0");
+  url.searchParams.set("fsGame", "q3js");
   return url.toString();
 };
