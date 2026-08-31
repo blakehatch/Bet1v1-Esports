@@ -18,6 +18,7 @@ dist
 .DS_Store
 cs2-data
 bet1v1-quake-3-js-server/baseq3/*.pk3
+bet1v1-quake-3-js-server/baseq3/q3key
 .nested-git-backups
 
 # RustRover
