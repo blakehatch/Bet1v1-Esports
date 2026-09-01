@@ -120,7 +120,9 @@ services:
 
   bet1v1-quake-3-js-server:
     profiles: ["bet1v1-quake-3-js-server"]
-    image: lukaklacar/q3js-server:1.0.0
+    build:
+      context: ./bet1v1-quake-3-js-server
+    image: bet1v1-q3js-server
     environment:
       Q3JS_GAME_HOST: 0.0.0.0
       Q3JS_MASTER_URL: ${Q3JS_MASTER_URL:-http://127.0.0.1:8080}

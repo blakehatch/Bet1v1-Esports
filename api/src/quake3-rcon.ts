@@ -5,7 +5,7 @@ export type WagerAsset = "SOL" | "USDC";
 
 const decimals: Record<WagerAsset, number> = { SOL: 9, USDC: 6 };
 
-export const formatWagerMoney = (amount: bigint, asset: WagerAsset) => {
+const formatWagerAmount = (amount: bigint, asset: WagerAsset) => {
   if (amount < 0n) throw new Error("Wager money cannot be negative");
   const scale = 10n ** BigInt(decimals[asset]);
   const whole = amount / scale;
@@ -13,8 +13,11 @@ export const formatWagerMoney = (amount: bigint, asset: WagerAsset) => {
     .toString()
     .padStart(decimals[asset], "0")
     .replace(/0+$/, "");
-  return `${whole}${fraction ? `.${fraction}` : ""} ${asset}`;
+  return `${whole}${fraction ? `.${fraction}` : ""}`;
 };
+
+export const formatWagerMoney = (amount: bigint, asset: WagerAsset) =>
+  `${formatWagerAmount(amount, asset)} ${asset}`;
 
 export const formatUsdEstimate = (amount: bigint, solUsdPrice?: number) => {
   if (!solUsdPrice || !Number.isFinite(solUsdPrice) || solUsdPrice <= 0) return "";
@@ -88,7 +91,10 @@ export const incrementalNotificationPlan = (notification: IncrementalNotificatio
   const estimate = notification.asset === "SOL"
     ? formatUsdEstimate(notification.won, notification.solUsdPrice)
     : "";
-  const payoutMessage = `Bet1v1: ${safeMessage(notification.winnerName)} +${formatWagerMoney(notification.won, notification.asset)}${estimate} | ${safeMessage(notification.makerName)} ${formatWagerMoney(notification.makerBalance, notification.asset)} vs ${safeMessage(notification.opponentName)} ${formatWagerMoney(notification.opponentBalance, notification.asset)}`;
+  const winnerIsMaker = notification.winnerName === notification.makerName;
+  const winnerBalance = winnerIsMaker ? notification.makerBalance : notification.opponentBalance;
+  const otherBalance = winnerIsMaker ? notification.opponentBalance : notification.makerBalance;
+  const payoutMessage = `Bet1v1: ${safeMessage(notification.winnerName)} won ${formatWagerMoney(notification.won, notification.asset)}${estimate} | ${formatWagerAmount(winnerBalance, notification.asset)} vs ${formatWagerAmount(otherBalance, notification.asset)} ${notification.asset}`;
   const privateSummaries = privateSummaryCommands(notification, payoutMessage);
   return {
     immediate: [sayCommand(payoutMessage), centerPrintCommand(payoutMessage), ...privateSummaries],

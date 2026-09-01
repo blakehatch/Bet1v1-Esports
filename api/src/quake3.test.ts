@@ -6,7 +6,8 @@ import {
   quake3EventId,
   quake3EventSchema,
   quake3IdentityForWallet,
-  quake3PlayUrl
+  quake3PlayUrl,
+  scoringWallets
 } from "./quake3.js";
 
 test("parses signed scores and opaque player names from getstatus", () => {
@@ -34,6 +35,77 @@ test("validates and deterministically identifies Q3JS kill callbacks", () => {
 test("caps the final kill tranche at the victim's remaining bankroll", () => {
   assert.equal(killPayout(5n, 100n), 5n);
   assert.equal(killPayout(5n, 2n), 2n);
+});
+
+const wagerPlayers = {
+  maker: "maker-wallet",
+  opponent: "opponent-wallet",
+  quake_maker_handle: "Blakewh",
+  quake_opponent_handle: "HuntrX",
+  maker_client_num: 0,
+  opponent_client_num: 1
+};
+
+test("credits the direct killer and debits the victim", () => {
+  const event = {
+    event: "kill" as const,
+    killer: { clientNum: 0, name: "Blakewh" },
+    victim: { clientNum: 1, name: "HuntrX" },
+    meansOfDeath: 6,
+    gameTime: 100,
+    serverTime: 200,
+    map: "q3dm17",
+    eventId: "direct-kill"
+  };
+  assert.deepEqual(
+    scoringWallets(event, wagerPlayers),
+    { beneficiary: "maker-wallet", victim: "opponent-wallet" }
+  );
+});
+
+test("credits the other wager player for a world death or suicide", () => {
+  assert.equal(quake3EventSchema.safeParse({
+    event: "death",
+    victim: { clientNum: 1, name: "HuntrX" },
+    meansOfDeath: 22,
+    observedAt: 123
+  }).success, true);
+  const opponentDeath = {
+    event: "death" as const,
+    victim: { clientNum: 1, name: "HuntrX" },
+    meansOfDeath: 22,
+    observedAt: 123,
+    eventId: "world-death"
+  };
+  const makerDeath = {
+    event: "death" as const,
+    victim: { clientNum: 0, name: "Blakewh" },
+    meansOfDeath: 20,
+    observedAt: 456,
+    eventId: "suicide"
+  };
+  assert.deepEqual(
+    scoringWallets(opponentDeath, wagerPlayers),
+    { beneficiary: "maker-wallet", victim: "opponent-wallet" }
+  );
+  assert.deepEqual(
+    scoringWallets(makerDeath, wagerPlayers),
+    { beneficiary: "opponent-wallet", victim: "maker-wallet" }
+  );
+});
+
+test("rejects scoring callbacks whose player identity does not match the wager", () => {
+  const event = {
+    event: "kill" as const,
+    killer: { clientNum: 5, name: "Impostor" },
+    victim: { clientNum: 1, name: "HuntrX" },
+    meansOfDeath: 6,
+    gameTime: 100,
+    serverTime: 200,
+    map: "q3dm17",
+    eventId: "bad-killer"
+  };
+  assert.equal(scoringWallets(event, wagerPlayers), null);
 });
 
 test("builds a Q3JS wager handoff with the dedicated server metadata", () => {

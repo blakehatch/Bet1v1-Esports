@@ -40,23 +40,23 @@ test("builds private remaining-balance and public incremental-win messages", () 
     }),
     {
       immediate: [
-        'say "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"',
-        'cp "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"',
-        'tell 1 "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"',
-        'tell 2 "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"'
+        'say "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"',
+        'cp "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"',
+        'tell 1 "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"',
+        'tell 2 "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"'
       ],
       repeats: [
         {
           delayMs: 2_500,
           commands: [
-            'cp "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"',
-            'tell 1 "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"',
-            'tell 2 "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"'
+            'cp "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"',
+            'tell 1 "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"',
+            'tell 2 "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"'
           ]
         },
         {
           delayMs: 5_000,
-          commands: ['cp "Bet1v1: b1v1_maker +0.25 USDC | b1v1_maker 1.25 USDC vs b1v1_opponent 0.75 USDC"']
+          commands: ['cp "Bet1v1: b1v1_maker won 0.25 USDC | 1.25 vs 0.75 USDC"']
         }
       ]
     }
@@ -97,21 +97,21 @@ test("omits a private message when the player is no longer connected", () => {
     }),
     {
       immediate: [
-        'say "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"',
-        'cp "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"',
-        'tell 4 "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"'
+        'say "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"',
+        'cp "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"',
+        'tell 4 "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"'
       ],
       repeats: [
         {
           delayMs: 2_500,
           commands: [
-            'cp "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"',
-            'tell 4 "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"'
+            'cp "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"',
+            'tell 4 "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"'
           ]
         },
         {
           delayMs: 5_000,
-          commands: ['cp "Bet1v1: b1v1_maker +0.000001 USDC | b1v1_maker 2 USDC vs b1v1_opponent 0 USDC"']
+          commands: ['cp "Bet1v1: b1v1_maker won 0.000001 USDC | 2 vs 0 USDC"']
         }
       ]
     }
@@ -145,10 +145,30 @@ test("adds a readable USD estimate and versus balances to SOL wins", () => {
   });
   assert.equal(
     plan.immediate[0],
-    'say "Bet1v1: alpha +0.05 SOL (~$10.00) | alpha 1.05 SOL vs bravo 0.95 SOL"'
+    'say "Bet1v1: alpha won 0.05 SOL (~$10.00) | 1.05 vs 0.95 SOL"'
   );
   assert.equal(plan.immediate[1]?.replace(/^cp /, "say "), plan.immediate[0]);
   assert.equal(plan.immediate[2]?.replace(/^tell 1 /, "say "), plan.immediate[0]);
+});
+
+test("puts the winner's balance first without repeating either name", () => {
+  const plan = incrementalNotificationPlan({
+    winnerName: "bravo",
+    makerName: "alpha",
+    opponentName: "bravo",
+    won: 50_000_000n,
+    asset: "SOL",
+    makerClientNum: 1,
+    opponentClientNum: 2,
+    makerBalance: 950_000_000n,
+    opponentBalance: 1_050_000_000n
+  });
+  assert.equal(
+    plan.immediate[0],
+    'say "Bet1v1: bravo won 0.05 SOL | 1.05 vs 0.95 SOL"'
+  );
+  assert.equal(plan.immediate[0]?.match(/bravo/g)?.length, 1);
+  assert.equal(plan.immediate[0]?.includes("alpha"), false);
 });
 
 test("announces both final balances when players cash out early", () => {

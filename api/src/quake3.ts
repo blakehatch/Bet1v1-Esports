@@ -16,11 +16,18 @@ export const quake3EventSchema = z.discriminatedUnion("event", [
     gameTime: z.number(),
     serverTime: z.number(),
     map: z.string()
+  }),
+  z.object({
+    event: z.literal("death"),
+    victim: player,
+    meansOfDeath: z.number().int(),
+    observedAt: z.number().int().nonnegative()
   })
 ]);
 
 export type Quake3Event = z.infer<typeof quake3EventSchema>;
 export type Quake3QueuedEvent = Quake3Event & { eventId: string };
+export type Quake3ScoringEvent = Extract<Quake3QueuedEvent, { event: "kill" | "death" }>;
 
 export const quake3EventId = (event: Quake3Event) =>
   createHash("sha256").update(JSON.stringify(event)).digest("hex");
@@ -53,6 +60,34 @@ type Quake3IdentityRow = {
 
 export const killPayout = (killValue: bigint, victimRemaining: bigint) =>
   killValue < victimRemaining ? killValue : victimRemaining;
+
+type Quake3WagerPlayers = {
+  maker: string;
+  opponent: string;
+  quake_maker_handle: string;
+  quake_opponent_handle: string;
+  maker_client_num: number;
+  opponent_client_num: number;
+};
+
+export const scoringWallets = (event: Quake3ScoringEvent, wager: Quake3WagerPlayers) => {
+  const victimIsMaker = event.victim.name === wager.quake_maker_handle
+    && event.victim.clientNum === wager.maker_client_num;
+  const victimIsOpponent = event.victim.name === wager.quake_opponent_handle
+    && event.victim.clientNum === wager.opponent_client_num;
+  if (!victimIsMaker && !victimIsOpponent) return null;
+
+  const victim = victimIsMaker ? wager.maker : wager.opponent;
+  const beneficiary = victimIsMaker ? wager.opponent : wager.maker;
+  if (event.event === "kill") {
+    const expectedKillerName = victimIsMaker ? wager.quake_opponent_handle : wager.quake_maker_handle;
+    const expectedKillerClientNum = victimIsMaker ? wager.opponent_client_num : wager.maker_client_num;
+    if (event.killer.name !== expectedKillerName || event.killer.clientNum !== expectedKillerClientNum) {
+      return null;
+    }
+  }
+  return { beneficiary, victim };
+};
 
 export const parseStatusResponse = (response: string): Quake3Score[] => {
   const lines = response.replace(/^\xff\xff\xff\xffstatusResponse\n/, "").split("\n");

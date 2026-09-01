@@ -11,7 +11,13 @@ import {
   redisConnection,
   WinnerEvent
 } from "./queue.js";
-import { getQuake3Scores, killPayout, Quake3QueuedEvent } from "./quake3.js";
+import {
+  getQuake3Scores,
+  killPayout,
+  Quake3QueuedEvent,
+  Quake3ScoringEvent,
+  scoringWallets
+} from "./quake3.js";
 import { getSolUsdPrice } from "./prices.js";
 import {
   cashOutNotificationPlan,
@@ -29,7 +35,7 @@ const chainQueueEvents = new QueueEvents(config.queueName, { connection: redisCo
 await chainQueueEvents.waitUntilReady();
 
 const processIdentityEvent = async (event: Quake3QueuedEvent) => {
-  if (event.event === "kill") return;
+  if (event.event === "kill" || event.event === "death") return;
   const client = await db.connect();
   try {
     await client.query("BEGIN");
@@ -77,36 +83,39 @@ type MatchedQuakeWager = {
   opponent_remaining: string;
   quake_maker_handle: string;
   quake_opponent_handle: string;
+  maker_client_num: number;
+  opponent_client_num: number;
 };
 
-const findKillWager = async (event: Extract<Quake3QueuedEvent, { event: "kill" }>) => {
+const findScoringWager = async (event: Quake3ScoringEvent) => {
   const result = await db.query(
     `SELECT * FROM wagers
      WHERE game = 'QUAKE3' AND status = 'MATCHED'
-       AND ((quake_maker_handle = $1 AND maker_client_num = $2 AND quake_opponent_handle = $3 AND opponent_client_num = $4)
-         OR (quake_opponent_handle = $1 AND opponent_client_num = $2 AND quake_maker_handle = $3 AND maker_client_num = $4))
+       AND ((quake_maker_handle = $1 AND maker_client_num = $2)
+         OR (quake_opponent_handle = $1 AND opponent_client_num = $2))
      LIMIT 1`,
-    [event.killer.name, event.killer.clientNum, event.victim.name, event.victim.clientNum]
+    [event.victim.name, event.victim.clientNum]
   );
   return result.rows[0] as MatchedQuakeWager | undefined;
 };
 
-const recordUnmatchedKill = async (event: Extract<Quake3QueuedEvent, { event: "kill" }>) => {
+const recordUnmatchedScore = async (event: Quake3ScoringEvent) => {
   await db.query(
     `INSERT INTO quake_events (event_id, event_type, payload, outcome, processed_at)
-     VALUES ($1, 'kill', $2, 'UNMATCHED_PLAYERS', NOW()) ON CONFLICT DO NOTHING`,
-    [event.eventId, JSON.stringify(event)]
+     VALUES ($1, $2, $3, 'UNMATCHED_PLAYERS', NOW()) ON CONFLICT DO NOTHING`,
+    [event.eventId, event.event, JSON.stringify(event)]
   );
 };
 
-const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill" }>) => {
-  const wager = await findKillWager(event);
-  if (!wager) {
-    await recordUnmatchedKill(event);
+const processScoringEvent = async (event: Quake3ScoringEvent) => {
+  const wager = await findScoringWager(event);
+  const wallets = wager ? scoringWallets(event, wager) : null;
+  if (!wager || !wallets) {
+    await recordUnmatchedScore(event);
     return;
   }
-  const killer = event.killer.name === wager.quake_maker_handle ? wager.maker : wager.opponent;
-  const victim = killer === wager.maker ? wager.opponent : wager.maker;
+  const killer = wallets.beneficiary;
+  const victim = wallets.victim;
 
   if (wager.payout_mode === "WINNER_TAKE_ALL") {
     const scores = await getQuake3Scores();
@@ -117,8 +126,8 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
     }
     const inserted = await db.query(
       `INSERT INTO quake_events (event_id, event_type, payload, wager_id, outcome, processed_at)
-       VALUES ($1, 'kill', $2, $3, 'SCORE_UPDATED', NOW()) ON CONFLICT DO NOTHING RETURNING event_id`,
-      [event.eventId, JSON.stringify(event), wager.wager_id]
+       VALUES ($1, $2, $3, $4, 'SCORE_UPDATED', NOW()) ON CONFLICT DO NOTHING RETURNING event_id`,
+      [event.eventId, event.event, JSON.stringify(event), wager.wager_id]
     );
     if (!inserted.rows[0]) return;
     await db.query(
@@ -149,8 +158,8 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
     await client.query("BEGIN");
     await client.query(
       `INSERT INTO quake_events (event_id, event_type, payload, wager_id, outcome)
-       VALUES ($1, 'kill', $2, $3, 'PAYOUT_PENDING') ON CONFLICT DO NOTHING`,
-      [event.eventId, JSON.stringify(event), wager.wager_id]
+       VALUES ($1, $2, $3, $4, 'PAYOUT_PENDING') ON CONFLICT DO NOTHING`,
+      [event.eventId, event.event, JSON.stringify(event), wager.wager_id]
     );
     const existing = await client.query("SELECT sequence FROM kill_payouts WHERE event_id = $1", [event.eventId]);
     if (existing.rows[0]) {
@@ -186,7 +195,9 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
 
 const gameWorker = new Worker<Quake3QueuedEvent>(
   config.gameQueueName,
-  async (job) => job.data.event === "kill" ? processKillEvent(job.data) : processIdentityEvent(job.data),
+  async (job) => job.data.event === "kill" || job.data.event === "death"
+    ? processScoringEvent(job.data)
+    : processIdentityEvent(job.data),
   { connection: redisConnection(), concurrency: 1 }
 );
 
