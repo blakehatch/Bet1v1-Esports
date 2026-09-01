@@ -69,7 +69,7 @@ const assertOnChainWager = async (
     || onChain.status !== expectedStatus
     || onChain.payoutMode !== payoutMode
     || onChain.makerRemaining !== BigInt(wager.amount)
-    || onChain.opponentRemaining !== (expectedStatus === 1 ? BigInt(wager.amount) : 0n)
+    || onChain.opponentRemaining !== BigInt(wager.amount)
   ) {
     throw new WagerRuleError("The on-chain escrow does not match this challenge", 409);
   }
