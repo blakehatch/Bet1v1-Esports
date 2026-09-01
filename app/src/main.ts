@@ -2,6 +2,7 @@ import "./style.css";
 import {
   Connection,
   PublicKey,
+  SendTransactionError,
   SystemProgram,
   SYSVAR_RENT_PUBKEY,
   Transaction,
@@ -365,7 +366,7 @@ const solUsdEstimate = (lamports: bigint) => solUsdPrice
 
 const liveWagerBalances = (wager: Wager) => {
   const bankroll = BigInt(wager.amount);
-  if (wager.status === "CASHED_OUT" && wager.makerFinalBalance != null && wager.opponentFinalBalance != null) {
+  if (wager.makerFinalBalance != null && wager.opponentFinalBalance != null) {
     return {
       maker: BigInt(wager.makerFinalBalance),
       opponent: BigInt(wager.opponentFinalBalance)
@@ -420,6 +421,18 @@ const instructionData = async (name: string, parts: Uint8Array[] = []) => {
 
 const pda = (seeds: Uint8Array[], programId: PublicKey) =>
   PublicKey.findProgramAddressSync(seeds.map((seed) => Buffer.from(seed)), programId)[0];
+
+const wagerOnChainStatus = async (wagerId: string) => {
+  const programId = new PublicKey(appConfig.programId);
+  const address = pda(
+    [new TextEncoder().encode("wager"), u64(BigInt(wagerId))],
+    programId
+  );
+  const account = await connection.getAccountInfo(address, "confirmed");
+  if (!account) return null;
+  if (account.data.length < 185) throw new Error("The on-chain wager account is invalid");
+  return account.data[184];
+};
 
 const associatedTokenAddress = (mint: PublicKey, owner: PublicKey) =>
   pda([owner.toBytes(), tokenProgramId.toBytes(), mint.toBytes()], associatedTokenProgramId);
@@ -508,12 +521,25 @@ const send = async (instruction: TransactionInstruction) => {
   const signed = injectedPhantom?.signTransaction
     ? await injectedPhantom.signTransaction(transaction)
     : await phantom.solana.signTransaction(transaction) as Transaction;
-  const signature = await connection.sendRawTransaction(signed.serialize(), {
-    skipPreflight: false,
-    preflightCommitment: "confirmed"
-  });
-  await connection.confirmTransaction({ signature, ...latest }, "confirmed");
-  return signature;
+  try {
+    const signature = await connection.sendRawTransaction(signed.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: "confirmed"
+    });
+    await connection.confirmTransaction({ signature, ...latest }, "confirmed");
+    return signature;
+  } catch (error) {
+    if (error instanceof SendTransactionError) {
+      const logs = await error.getLogs(connection).catch(() => error.logs ?? []);
+      console.error("Solana transaction logs", logs);
+      if (logs?.some((line) => line.includes("WagerNotOpen"))) {
+        throw new Error(
+          "This wager is already funded on-chain. Refreshing its match status is safe; do not fund it again."
+        );
+      }
+    }
+    throw error;
+  }
 };
 
 const stakeOnChain = async (amount: bigint) => {
@@ -674,13 +700,13 @@ const wagerActions = (wager: Wager) => {
     return `<button class="secondary decline" data-cancel="${wager.wagerId}">CANCEL & REFUND</button>`;
   }
   if (wager.status === "ACCEPTED" && wager.maker === walletAddress) {
-    return `<button data-fund-maker="${wager.wagerId}">FUND ESCROW</button>`;
+    return `<div class="stack"><button data-fund-maker="${wager.wagerId}">FUND ${displayAmount(wager.amount, assetDecimals(wager.asset))} ${wager.asset} ESCROW</button><button class="secondary decline" data-cancel-intent="${wager.wagerId}">CANCEL CHALLENGE</button></div>`;
   }
   if (wager.status === "ACCEPTED" && wager.opponent === walletAddress) {
-    return `<span class="action-state">ACCEPTED · WAITING FOR MAKER TO FUND</span>`;
+    return `<div class="stack"><span class="action-state">ACCEPTED · WAITING FOR MAKER TO FUND</span><button class="secondary decline" data-decline="${wager.wagerId}">WITHDRAW ACCEPTANCE</button></div>`;
   }
   if (wager.status === "MAKER_FUNDED" && wager.opponent === walletAddress) {
-    return `<button data-join="${wager.wagerId}">FUND & START MATCH</button>`;
+    return `<button data-join="${wager.wagerId}">FUND ${displayAmount(wager.amount, assetDecimals(wager.asset))} ${wager.asset} & START MATCH</button>`;
   }
   if (wager.status === "MAKER_FUNDED" && wager.maker === walletAddress) {
     return `<div class="stack"><span class="action-state">ESCROW FUNDED · WAITING FOR OPPONENT</span><button class="secondary decline" data-cancel="${wager.wagerId}">CANCEL & REFUND</button></div>`;
@@ -727,7 +753,7 @@ const renderWager = (wager: Wager, action = "", history = false) => {
     transactionLink(wager.joinSignature, "JOIN TX"),
     transactionLink(
       wager.settlementSignature,
-      wager.status === "DECLINED" ? "REFUND TX" : wager.status === "CASHED_OUT" ? "CASH OUT TX" : "SETTLEMENT TX"
+      wager.status === "DECLINED" || wager.status === "CANCELLED" ? "REFUND TX" : wager.status === "CASHED_OUT" ? "CASH OUT TX" : "SETTLEMENT TX"
     ),
     !wager.createSignature && !wager.joinSignature && !wager.settlementSignature
       ? transactionLink(wager.chainSignature, "LATEST TX") : ""
@@ -965,6 +991,7 @@ document.addEventListener("click", async (event) => {
   const joinId = target.closest<HTMLElement>("[data-join]")?.dataset.join;
   const acceptIntentId = target.closest<HTMLElement>("[data-accept-intent]")?.dataset.acceptIntent;
   const fundMakerId = target.closest<HTMLElement>("[data-fund-maker]")?.dataset.fundMaker;
+  const cancelIntentId = target.closest<HTMLElement>("[data-cancel-intent]")?.dataset.cancelIntent;
   const declineId = target.closest<HTMLElement>("[data-decline]")?.dataset.decline;
   const cancelId = target.closest<HTMLElement>("[data-cancel]")?.dataset.cancel;
   const cashoutId = target.closest<HTMLElement>("[data-cashout]")?.dataset.cashout;
@@ -992,7 +1019,14 @@ document.addEventListener("click", async (event) => {
       const wagers = await api<Wager[]>(`/wagers?wallet=${walletAddress}&game=${selectedGame}`);
       const wager = wagers.find((item) => item.wagerId === fundMakerId);
       if (!wager || wager.status !== "ACCEPTED") throw new Error("Challenge is not ready for funding");
-      const signature = appConfig.mockChain ? `mock-maker-fund-${fundMakerId}` : await createWagerOnChain(wager);
+      let signature: string | undefined;
+      if (appConfig.mockChain) {
+        signature = `mock-maker-fund-${fundMakerId}`;
+      } else {
+        const status = await wagerOnChainStatus(wager.wagerId);
+        if (status === null) signature = await createWagerOnChain(wager);
+        else if (status !== 0) throw new Error("This challenge is already joined or closed on-chain");
+      }
       await api(`/wagers/${fundMakerId}/chain`, {
         method: "POST",
         body: JSON.stringify({ maker: walletAddress, signature })
@@ -1000,13 +1034,26 @@ document.addEventListener("click", async (event) => {
       await Promise.all([refreshWagers(), refreshBalances()]);
       notice(`Challenge #${fundMakerId} maker escrow funded.`, appConfig.mockChain ? undefined : signature);
     }
+    if (cancelIntentId) {
+      await api(`/wagers/${cancelIntentId}/cancel-intent`, {
+        method: "POST",
+        body: JSON.stringify({ maker: walletAddress })
+      });
+      await refreshWagers();
+      notice(`Challenge #${cancelIntentId} cancelled. No funds moved on-chain.`);
+    }
     if (joinId) {
       const wagers = await api<Wager[]>(`/wagers?wallet=${walletAddress}&game=${selectedGame}`);
       const wager = wagers.find((item) => item.wagerId === joinId);
       if (!wager || (wager.status !== "MAKER_FUNDED" && !(wager.status === "OPEN" && wager.createSignature))) {
         throw new Error("Challenge is no longer ready to start");
       }
-      const signature = appConfig.mockChain ? undefined : await joinWagerOnChain(wager);
+      let signature: string | undefined;
+      if (!appConfig.mockChain) {
+        const status = await wagerOnChainStatus(wager.wagerId);
+        if (status === 0) signature = await joinWagerOnChain(wager);
+        else if (status !== 1) throw new Error("This challenge is already closed on-chain");
+      }
       const accepted = await api<Wager>(`/wagers/${joinId}/accept`, { method: "POST", body: JSON.stringify({ opponent: walletAddress, signature }) });
       rememberIdentity(accepted);
       await Promise.all([refreshWagers(), refreshBalances()]);

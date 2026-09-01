@@ -33,11 +33,15 @@ test("rejects truncated config accounts", () => {
 
 test("decodes on-chain wager balances used for cash-out", () => {
   const maker = Keypair.generate().publicKey;
+  const challenger = Keypair.generate().publicKey;
   const opponent = Keypair.generate().publicKey;
+  const tokenMint = Keypair.generate().publicKey;
   const data = Buffer.alloc(219);
   maker.toBuffer().copy(data, 16);
+  challenger.toBuffer().copy(data, 48);
   opponent.toBuffer().copy(data, 80);
   data.writeBigUInt64LE(100_000_000n, 112);
+  tokenMint.toBuffer().copy(data, 120);
   data[184] = 1;
   data[185] = 1;
   data.writeBigUInt64LE(100_000_000n, 194);
@@ -45,8 +49,10 @@ test("decodes on-chain wager balances used for cash-out", () => {
 
   const decoded = decodeWagerAccount(data);
   assert.equal(decoded.maker.toBase58(), maker.toBase58());
+  assert.equal(decoded.challenger.toBase58(), challenger.toBase58());
   assert.equal(decoded.opponent.toBase58(), opponent.toBase58());
   assert.equal(decoded.amount, 100_000_000n);
+  assert.equal(decoded.tokenMint.toBase58(), tokenMint.toBase58());
   assert.equal(decoded.status, 1);
   assert.equal(decoded.payoutMode, 1);
   assert.equal(decoded.makerRemaining, 100_000_000n);

@@ -79,13 +79,25 @@ export const decodeWagerAccount = (accountData: Uint8Array) => {
   if (data.length < 210) throw new Error("Program wager account is truncated");
   return {
     maker: new PublicKey(data.subarray(16, 48)),
+    challenger: new PublicKey(data.subarray(48, 80)),
     opponent: new PublicKey(data.subarray(80, 112)),
     amount: data.readBigUInt64LE(112),
+    tokenMint: new PublicKey(data.subarray(120, 152)),
     status: data[184],
     payoutMode: data[185],
     makerRemaining: data.readBigUInt64LE(194),
     opponentRemaining: data.readBigUInt64LE(202)
   };
+};
+
+export const getWagerAccount = async (wagerId: string) => {
+  const wagerIdBytes = u64(BigInt(wagerId));
+  const [address] = PublicKey.findProgramAddressSync(
+    [Buffer.from("wager"), wagerIdBytes],
+    programId
+  );
+  const account = await connection.getAccountInfo(address, "confirmed");
+  return account ? decodeWagerAccount(account.data) : null;
 };
 
 export const getAccess = async (wallet: string) => {

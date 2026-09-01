@@ -3,7 +3,7 @@ import cors from "@fastify/cors";
 import { Redis } from "ioredis";
 import { z } from "zod";
 import { PublicKey } from "@solana/web3.js";
-import { chainAddresses, getAccess } from "./chain.js";
+import { chainAddresses, getAccess, getWagerAccount } from "./chain.js";
 import { createChallenge, requireWalletSession, verifyChallenge } from "./auth.js";
 import { config } from "./config.js";
 import { db, migrate, serializeWager } from "./db.js";
@@ -40,6 +40,52 @@ const wallet = z.string().refine((value) => {
     return false;
   }
 }, "Invalid wallet");
+
+type ChainBackedWager = {
+  wager_id: string;
+  maker: string;
+  opponent: string | null;
+  amount: string;
+  asset: "SOL" | "USDC";
+  payout_mode: "WINNER_TAKE_ALL" | "INCREMENTAL";
+};
+
+const assertOnChainWager = async (
+  wager: ChainBackedWager,
+  expectedStatus: 0 | 1,
+  expectedOpponent?: string
+) => {
+  if (config.mockChain) return;
+  const onChain = await getWagerAccount(String(wager.wager_id));
+  const expectedMint = wager.asset === "USDC" ? chainAddresses.usdcMint : PublicKey.default.toBase58();
+  const payoutMode = wager.payout_mode === "INCREMENTAL" ? 1 : 0;
+  const participantsMatch = onChain?.maker.equals(new PublicKey(wager.maker))
+    && (expectedStatus === 0 || Boolean(expectedOpponent && onChain.opponent.equals(new PublicKey(expectedOpponent))));
+  if (
+    !onChain
+    || !participantsMatch
+    || onChain.amount !== BigInt(wager.amount)
+    || onChain.tokenMint.toBase58() !== expectedMint
+    || onChain.status !== expectedStatus
+    || onChain.payoutMode !== payoutMode
+    || onChain.makerRemaining !== BigInt(wager.amount)
+    || onChain.opponentRemaining !== (expectedStatus === 1 ? BigInt(wager.amount) : 0n)
+  ) {
+    throw new WagerRuleError("The on-chain escrow does not match this challenge", 409);
+  }
+};
+
+const otherQuakeReservationExists = async (wagerId: string) => {
+  const active = await db.query(
+    `SELECT wager_id FROM wagers
+     WHERE game = 'QUAKE3'
+       AND status IN ('ACCEPTED', 'MAKER_FUNDED', 'MATCHED', 'SETTLING', 'CASHING_OUT')
+       AND wager_id <> $1
+     LIMIT 1`,
+    [wagerId]
+  );
+  return Boolean(active.rows[0]);
+};
 
 const privateWager = (row: Record<string, unknown>, role: "maker" | "opponent") => {
   const handle = String(row[role === "maker" ? "quake_maker_handle" : "quake_opponent_handle"] ?? "");
@@ -316,13 +362,22 @@ app.post("/wagers", async (request) => {
 
 app.post("/wagers/:wagerId/chain", async (request) => {
   const params = z.object({ wagerId: z.string().regex(/^\d+$/) }).parse(request.params);
-  const body = z.object({ maker: wallet, signature: z.string().min(1) }).parse(request.body);
+  const body = z.object({ maker: wallet, signature: z.string().min(1).optional() }).parse(request.body);
   await requireWalletSession(request.headers.authorization, body.maker);
+  const targetResult = await db.query(
+    `SELECT wager_id, maker, opponent, amount, asset, payout_mode
+     FROM wagers WHERE wager_id = $1 AND maker = $2 AND status = 'ACCEPTED' AND opponent IS NOT NULL`,
+    [params.wagerId, body.maker]
+  );
+  const target = targetResult.rows[0] as ChainBackedWager | undefined;
+  if (!target) throw new WagerRuleError("Challenge is not ready for maker funding", 409);
+  await assertOnChainWager(target, 0);
   const result = await db.query(
-    `UPDATE wagers SET chain_signature = $3, create_signature = $3, status = 'MAKER_FUNDED'
+    `UPDATE wagers SET chain_signature = COALESCE($3, chain_signature),
+       create_signature = COALESCE($3, create_signature), status = 'MAKER_FUNDED'
      WHERE wager_id = $1 AND maker = $2 AND status = 'ACCEPTED' AND opponent IS NOT NULL
      RETURNING wager_id`,
-    [params.wagerId, body.maker, body.signature]
+    [params.wagerId, body.maker, body.signature ?? null]
   );
   if (!result.rows[0]) throw new WagerRuleError("Challenge is not ready for maker funding", 409);
   return { ok: true };
@@ -346,20 +401,31 @@ app.post("/wagers/:wagerId/accept-intent", async (request) => {
     status: string;
     create_signature: string | null;
   } | undefined;
-  assertWagerCanBeAccepted(target, body.opponent, false);
+  const sharedQuakeServerOccupied = target?.game === "QUAKE3"
+    ? await otherQuakeReservationExists(params.wagerId)
+    : false;
+  assertWagerCanBeAccepted(target, body.opponent, sharedQuakeServerOccupied);
   const opponentUsername = profile.rows[0]?.username as string | null | undefined;
   if (target?.game === "QUAKE3" && !opponentUsername) {
     throw new WagerRuleError("Choose a username before accepting a Quake challenge", 409);
   }
   if (target?.create_signature) throw new WagerRuleError("Challenge is already funded", 409);
-  const result = await db.query(
-    `UPDATE wagers SET opponent = $2, status = 'ACCEPTED',
-       quake_opponent_handle = CASE WHEN game = 'QUAKE3' THEN $3 ELSE quake_opponent_handle END
-     WHERE wager_id = $1 AND status = 'OPEN' AND create_signature IS NULL
-       AND maker <> $2 AND (challenger IS NULL OR challenger = $2)
-     RETURNING *`,
-    [params.wagerId, body.opponent, opponentUsername ?? null]
-  );
+  let result;
+  try {
+    result = await db.query(
+      `UPDATE wagers SET opponent = $2, status = 'ACCEPTED',
+         quake_opponent_handle = CASE WHEN game = 'QUAKE3' THEN $3 ELSE quake_opponent_handle END
+       WHERE wager_id = $1 AND status = 'OPEN' AND create_signature IS NULL
+         AND maker <> $2 AND (challenger IS NULL OR challenger = $2)
+       RETURNING *`,
+      [params.wagerId, body.opponent, opponentUsername ?? null]
+    );
+  } catch (error) {
+    if ((error as { code?: string }).code === "23505") {
+      throw new WagerRuleError("The shared Quake 3 server already has an active wager", 409);
+    }
+    throw error;
+  }
   if (!result.rows[0]) throw new WagerRuleError("Wager is unavailable", 409);
   return result.rows[0].game === "QUAKE3"
     ? privateWager(result.rows[0], "opponent")
@@ -368,32 +434,30 @@ app.post("/wagers/:wagerId/accept-intent", async (request) => {
 
 app.post("/wagers/:wagerId/accept", async (request) => {
   const params = z.object({ wagerId: z.string().regex(/^\d+$/) }).parse(request.params);
-  const body = z.object({ opponent: wallet, signature: z.string().min(1) }).parse(request.body);
+  const body = z.object({ opponent: wallet, signature: z.string().min(1).optional() }).parse(request.body);
   await requireWalletSession(request.headers.authorization, body.opponent);
   const access = await getAccess(body.opponent);
   assertWagerAccess(access.active);
   const targetResult = await db.query(
-    "SELECT maker, challenger, opponent, game, status, create_signature FROM wagers WHERE wager_id = $1",
+    `SELECT wager_id, maker, challenger, opponent, game, status, create_signature,
+       amount, asset, payout_mode FROM wagers WHERE wager_id = $1`,
     [params.wagerId]
   );
   const target = targetResult.rows[0] as {
+    wager_id: string;
     maker: string;
     challenger: string | null;
     opponent: string | null;
     game: "CS2" | "QUAKE3";
     status: string;
     create_signature: string | null;
+    amount: string;
+    asset: "SOL" | "USDC";
+    payout_mode: "WINNER_TAKE_ALL" | "INCREMENTAL";
   } | undefined;
-  let sharedQuakeServerOccupied = false;
-  if (target?.game === "QUAKE3") {
-    const activeQuake = await db.query(
-      `SELECT wager_id FROM wagers
-       WHERE game = 'QUAKE3' AND status IN ('MATCHED', 'SETTLING', 'CASHING_OUT') AND wager_id <> $1
-       LIMIT 1`,
-      [params.wagerId]
-    );
-    sharedQuakeServerOccupied = Boolean(activeQuake.rows[0]);
-  }
+  const sharedQuakeServerOccupied = target?.game === "QUAKE3"
+    ? await otherQuakeReservationExists(params.wagerId)
+    : false;
   const legacyFunded = target?.status === "OPEN" && Boolean(target.create_signature);
   if (!target || target.maker === body.opponent || sharedQuakeServerOccupied
       || (!legacyFunded && (target.status !== "MAKER_FUNDED" || target.opponent !== body.opponent))
@@ -403,12 +467,13 @@ app.post("/wagers/:wagerId/accept", async (request) => {
       409
     );
   }
+  await assertOnChainWager(target as ChainBackedWager, 1, body.opponent);
   const result = await db.query(
     `UPDATE wagers
      SET opponent = $2, status = 'MATCHED',
          server_address = CASE WHEN game = 'QUAKE3' THEN $4 ELSE $3 END,
-         chain_signature = $5,
-         join_signature = $5,
+         chain_signature = COALESCE($5, chain_signature),
+         join_signature = COALESCE($5, join_signature),
          opponent_remaining = amount
      WHERE wager_id = $1
        AND (status = 'MAKER_FUNDED' OR (status = 'OPEN' AND create_signature IS NOT NULL))
@@ -420,7 +485,7 @@ app.post("/wagers/:wagerId/accept", async (request) => {
       body.opponent,
       config.serverAddress,
       config.quake3ServerAddress,
-      body.signature
+      body.signature ?? null
     ]
   );
   if (!result.rows[0]) {
@@ -437,13 +502,29 @@ app.post("/wagers/:wagerId/decline", async (request) => {
   await requireWalletSession(request.headers.authorization, body.challenger);
   const reserved = await db.query(
     `UPDATE wagers SET status = 'DECLINED', maker_remaining = 0
-     WHERE wager_id = $1 AND challenger = $2 AND opponent IS NULL
-       AND status = 'OPEN' AND create_signature IS NULL
+     WHERE wager_id = $1 AND create_signature IS NULL
+       AND ((status = 'OPEN' AND challenger = $2 AND opponent IS NULL)
+         OR (status = 'ACCEPTED' AND opponent = $2))
      RETURNING wager_id`,
     [params.wagerId, body.challenger]
   );
   if (!reserved.rows[0]) throw new WagerRuleError("Reserved challenge is no longer open", 409);
   return { declined: true };
+});
+
+app.post("/wagers/:wagerId/cancel-intent", async (request) => {
+  const params = z.object({ wagerId: z.string().regex(/^\d+$/) }).parse(request.params);
+  const body = z.object({ maker: wallet }).parse(request.body);
+  await requireWalletSession(request.headers.authorization, body.maker);
+  const result = await db.query(
+    `UPDATE wagers SET status = 'CANCELLED'
+     WHERE wager_id = $1 AND maker = $2 AND status = 'ACCEPTED'
+       AND create_signature IS NULL
+     RETURNING wager_id`,
+    [params.wagerId, body.maker]
+  );
+  if (!result.rows[0]) throw new WagerRuleError("Accepted challenge is no longer cancellable", 409);
+  return { cancelled: true };
 });
 
 app.post("/wagers/:wagerId/cancel", async (request) => {

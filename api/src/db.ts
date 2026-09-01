@@ -109,7 +109,8 @@ const migrationSql = `
     DROP INDEX IF EXISTS wagers_quake_opponent_handle_idx;
     DROP INDEX IF EXISTS wagers_one_active_quake_idx;
     CREATE UNIQUE INDEX IF NOT EXISTS wagers_one_active_quake_idx
-      ON wagers (game) WHERE game = 'QUAKE3' AND status IN ('MATCHED', 'SETTLING', 'CASHING_OUT');
+      ON wagers (game) WHERE game = 'QUAKE3'
+        AND status IN ('ACCEPTED', 'MAKER_FUNDED', 'MATCHED', 'SETTLING', 'CASHING_OUT');
 
     CREATE TABLE IF NOT EXISTS quake_events (
       event_id TEXT PRIMARY KEY,
