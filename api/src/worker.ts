@@ -1,16 +1,28 @@
 import { Job, QueueEvents, Worker } from "bullmq";
-import { settleKill, settleWager } from "./chain.js";
+import { cashOutWager, settleIncrement, settleWager } from "./chain.js";
 import { config } from "./config.js";
 import { db, migrate } from "./db.js";
 import {
   chainQueue,
+  CashOutEvent,
   ChainAction,
   gameQueue,
-  KillPayoutEvent,
+  IncrementPayoutEvent,
   redisConnection,
   WinnerEvent
 } from "./queue.js";
 import { getQuake3Scores, killPayout, Quake3QueuedEvent } from "./quake3.js";
+import { getSolUsdPrice } from "./prices.js";
+import {
+  cashOutNotificationPlan,
+  incrementalNotificationPlan,
+  Quake3NotificationPlan,
+  Quake3NotificationScheduler,
+  remainingBalancesAfterIncrement,
+  WagerAsset,
+  winnerTakeAllNotificationPlan
+} from "./quake3-rcon.js";
+import { assertWinnerIsParticipant, winnerAtFragLimit } from "./wagers.js";
 
 await migrate();
 const chainQueueEvents = new QueueEvents(config.queueName, { connection: redisConnection() });
@@ -58,9 +70,9 @@ type MatchedQuakeWager = {
   wager_id: string;
   maker: string;
   opponent: string;
-  payout_mode: "WINNER_TAKE_ALL" | "PER_KILL";
+  payout_mode: "WINNER_TAKE_ALL" | "INCREMENTAL";
   frag_limit: number;
-  kill_value: string;
+  increment_value: string;
   maker_remaining: string;
   opponent_remaining: string;
   quake_maker_handle: string;
@@ -113,11 +125,13 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
       "UPDATE wagers SET maker_score = $2, opponent_score = $3 WHERE wager_id = $1",
       [wager.wager_id, makerScore, opponentScore]
     );
-    const winner = makerScore >= wager.frag_limit
-      ? wager.maker
-      : opponentScore >= wager.frag_limit
-        ? wager.opponent
-        : undefined;
+    const winner = winnerAtFragLimit(
+      makerScore,
+      opponentScore,
+      wager.frag_limit,
+      wager.maker,
+      wager.opponent
+    );
     if (winner) {
       await chainQueue.add("settle-wager", { wagerId: String(wager.wager_id), winner }, {
         jobId: `settle-${wager.wager_id}`
@@ -127,7 +141,7 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
   }
 
   const victimRemaining = BigInt(victim === wager.maker ? wager.maker_remaining : wager.opponent_remaining);
-  const amount = killPayout(BigInt(wager.kill_value), victimRemaining);
+  const amount = killPayout(BigInt(wager.increment_value), victimRemaining);
   if (amount <= 0n) return;
   const client = await db.connect();
   let sequence = 0;
@@ -160,13 +174,13 @@ const processKillEvent = async (event: Extract<Quake3QueuedEvent, { event: "kill
   } finally {
     client.release();
   }
-  const payoutJob = await chainQueue.add("settle-kill", {
+  const payoutJob = await chainQueue.add("settle-increment", {
     eventId: event.eventId,
     wagerId: String(wager.wager_id),
-    killer,
-    victim,
+    beneficiary: killer,
+    debitedPlayer: victim,
     sequence
-  }, { jobId: `settle-kill-${event.eventId}` });
+  }, { jobId: `settle-increment-${event.eventId}` });
   await payoutJob.waitUntilFinished(chainQueueEvents, 30_000);
 };
 
@@ -176,26 +190,81 @@ const gameWorker = new Worker<Quake3QueuedEvent>(
   { connection: redisConnection(), concurrency: 1 }
 );
 
+const quake3Notifications = new Quake3NotificationScheduler(
+  undefined,
+  (error) => console.error("Unable to send a repeated Quake 3 notification", error)
+);
+
+const notifyQuake3 = async (
+  wagerId: string,
+  label: string,
+  plan: () => Quake3NotificationPlan
+) => {
+  try {
+    await quake3Notifications.notify(wagerId, plan());
+  } catch (error) {
+    console.error(`Unable to send Quake 3 ${label} notification`, error);
+  }
+};
+
+const solPriceFor = async (asset: WagerAsset) => {
+  if (asset !== "SOL") return undefined;
+  try {
+    return (await getSolUsdPrice()).usd;
+  } catch (error) {
+    console.error("Unable to add a SOL/USD estimate to the Quake notification", error);
+    return undefined;
+  }
+};
+
+type WinnerTakeAllWager = {
+  maker: string;
+  opponent: string;
+  game: "CS2" | "QUAKE3";
+  asset: WagerAsset;
+  amount: string;
+  quake_maker_handle: string | null;
+  quake_opponent_handle: string | null;
+};
+
 const processWinner = async (event: WinnerEvent) => {
   const result = await db.query(
     `UPDATE wagers SET status = 'SETTLING'
      WHERE wager_id = $1 AND status IN ('MATCHED', 'SETTLING') AND winner IS NULL
      AND payout_mode = 'WINNER_TAKE_ALL'
-     RETURNING maker, opponent`,
+     RETURNING maker, opponent, game, asset, amount,
+       quake_maker_handle, quake_opponent_handle`,
     [event.wagerId]
   );
-  const wager = result.rows[0] as { maker: string; opponent: string } | undefined;
+  const wager = result.rows[0] as WinnerTakeAllWager | undefined;
   if (!wager) return;
-  if (event.winner !== wager.maker && event.winner !== wager.opponent) {
-    throw new Error("Winner is not a wager participant");
-  }
+  assertWinnerIsParticipant(event.winner, wager.maker, wager.opponent);
   try {
     const signature = await settleWager(event.wagerId, event.winner);
     await db.query(
       `UPDATE wagers SET status = 'SETTLED', winner = $2, chain_signature = $3,
+         settlement_signature = $3,
          maker_remaining = 0, opponent_remaining = 0 WHERE wager_id = $1`,
       [event.wagerId, event.winner, signature]
     );
+    if (wager.game === "QUAKE3") {
+      const winnerName = event.winner === wager.maker
+        ? wager.quake_maker_handle
+        : wager.quake_opponent_handle;
+      if (winnerName) {
+        const solUsdPrice = await solPriceFor(wager.asset);
+        await notifyQuake3(
+          event.wagerId,
+          "winner-take-all",
+          () => winnerTakeAllNotificationPlan(
+            winnerName,
+            BigInt(wager.amount) * 2n,
+            wager.asset,
+            solUsdPrice
+          )
+        );
+      }
+    }
     return signature;
   } catch (error) {
     await db.query("UPDATE wagers SET status = 'MATCHED' WHERE wager_id = $1 AND winner IS NULL", [event.wagerId]);
@@ -203,23 +272,48 @@ const processWinner = async (event: WinnerEvent) => {
   }
 };
 
-const processKillPayout = async (event: KillPayoutEvent) => {
+type IncrementPayoutRow = {
+  payout_amount: string;
+  payout_status: string;
+  status: string;
+  payout_mode: string;
+  maker: string;
+  opponent: string;
+  game: "CS2" | "QUAKE3";
+  asset: WagerAsset;
+  amount: string;
+  maker_remaining: string;
+  opponent_remaining: string;
+  maker_client_num: number | null;
+  opponent_client_num: number | null;
+  quake_maker_handle: string | null;
+  quake_opponent_handle: string | null;
+};
+
+const processIncrementPayout = async (event: IncrementPayoutEvent) => {
   const result = await db.query(
     `SELECT k.amount AS payout_amount, k.status AS payout_status, w.*
      FROM kill_payouts k JOIN wagers w USING (wager_id)
      WHERE k.event_id = $1`,
     [event.eventId]
   );
-  const row = result.rows[0] as Record<string, unknown> | undefined;
+  const row = result.rows[0] as IncrementPayoutRow | undefined;
   if (!row || row.payout_status === "PAID") return;
-  if (row.status !== "MATCHED" || row.payout_mode !== "PER_KILL") {
-    throw new Error("Per-kill wager is not payable");
+  if (row.status !== "MATCHED" || row.payout_mode !== "INCREMENTAL") {
+    throw new Error("Incremental wager is not payable");
   }
-  const signature = await settleKill(event.wagerId, event.killer, event.sequence);
+  const signature = await settleIncrement(event.wagerId, event.beneficiary, event.sequence);
   const amount = BigInt(String(row.payout_amount));
-  const killerIsMaker = event.killer === row.maker;
-  const victimRemaining = BigInt(String(killerIsMaker ? row.opponent_remaining : row.maker_remaining));
-  const finalKill = amount >= victimRemaining;
+  const beneficiaryIsMaker = event.beneficiary === row.maker;
+  const debitedRemaining = BigInt(String(beneficiaryIsMaker ? row.opponent_remaining : row.maker_remaining));
+  const finalIncrement = amount >= debitedRemaining;
+  const { makerRemaining, opponentRemaining } = remainingBalancesAfterIncrement(
+    BigInt(row.maker_remaining),
+    BigInt(row.opponent_remaining),
+    beneficiaryIsMaker,
+    amount,
+    finalIncrement
+  );
   const client = await db.connect();
   try {
     await client.query("BEGIN");
@@ -231,16 +325,16 @@ const processKillPayout = async (event: KillPayoutEvent) => {
       `UPDATE quake_events SET outcome = 'PAYOUT_PAID', processed_at = NOW() WHERE event_id = $1`,
       [event.eventId]
     );
-    if (killerIsMaker) {
+    if (beneficiaryIsMaker) {
       await client.query(
         `UPDATE wagers SET maker_score = maker_score + 1,
            opponent_remaining = CASE WHEN $2 THEN 0 ELSE opponent_remaining - $3 END,
            maker_remaining = CASE WHEN $2 THEN 0 ELSE maker_remaining END,
            status = CASE WHEN $2 THEN 'SETTLED' ELSE status END,
            winner = CASE WHEN $2 THEN maker ELSE winner END,
-           chain_signature = $4
+           chain_signature = $4, settlement_signature = $4
          WHERE wager_id = $1`,
-        [event.wagerId, finalKill, amount.toString(), signature]
+        [event.wagerId, finalIncrement, amount.toString(), signature]
       );
     } else {
       await client.query(
@@ -249,9 +343,9 @@ const processKillPayout = async (event: KillPayoutEvent) => {
            opponent_remaining = CASE WHEN $2 THEN 0 ELSE opponent_remaining END,
            status = CASE WHEN $2 THEN 'SETTLED' ELSE status END,
            winner = CASE WHEN $2 THEN opponent ELSE winner END,
-           chain_signature = $4
+           chain_signature = $4, settlement_signature = $4
          WHERE wager_id = $1`,
-        [event.wagerId, finalKill, amount.toString(), signature]
+        [event.wagerId, finalIncrement, amount.toString(), signature]
       );
     }
     await client.query("COMMIT");
@@ -261,18 +355,107 @@ const processKillPayout = async (event: KillPayoutEvent) => {
   } finally {
     client.release();
   }
+  if (row.game === "QUAKE3") {
+    const winnerName = beneficiaryIsMaker
+      ? row.quake_maker_handle
+      : row.quake_opponent_handle;
+    if (winnerName) {
+      const bankroll = BigInt(row.amount);
+      const makerBalance = finalIncrement && beneficiaryIsMaker
+        ? bankroll * 2n
+        : finalIncrement
+          ? 0n
+          : makerRemaining + (bankroll - opponentRemaining);
+      const opponentBalance = finalIncrement && !beneficiaryIsMaker
+        ? bankroll * 2n
+        : finalIncrement
+          ? 0n
+          : opponentRemaining + (bankroll - makerRemaining);
+      const solUsdPrice = await solPriceFor(row.asset);
+      await notifyQuake3(
+        event.wagerId,
+        "incremental payout",
+        () => incrementalNotificationPlan({
+          winnerName,
+          makerName: row.quake_maker_handle ?? "Maker",
+          opponentName: row.quake_opponent_handle ?? "Opponent",
+          won: amount,
+          asset: row.asset,
+          solUsdPrice,
+          makerClientNum: row.maker_client_num,
+          opponentClientNum: row.opponent_client_num,
+          makerBalance,
+          opponentBalance
+        })
+      );
+    }
+  }
   return signature;
+};
+
+type CashOutRow = {
+  status: string;
+  payout_mode: string;
+  game: "CS2" | "QUAKE3";
+  asset: WagerAsset;
+  amount: string;
+  maker_remaining: string;
+  opponent_remaining: string;
+  maker_client_num: number | null;
+  opponent_client_num: number | null;
+  quake_maker_handle: string | null;
+  quake_opponent_handle: string | null;
+};
+
+const processCashOut = async (event: CashOutEvent) => {
+  const result = await db.query("SELECT * FROM wagers WHERE wager_id = $1", [event.wagerId]);
+  const row = result.rows[0] as CashOutRow | undefined;
+  if (!row || row.status === "CASHED_OUT") return;
+  if (row.status !== "CASHING_OUT" || row.payout_mode !== "INCREMENTAL") {
+    throw new Error("Incremental wager is not ready to cash out");
+  }
+  const cashOut = await cashOutWager(event.wagerId);
+  const makerBalance = cashOut.makerRemaining + (cashOut.amount - cashOut.opponentRemaining);
+  const opponentBalance = cashOut.opponentRemaining + (cashOut.amount - cashOut.makerRemaining);
+  await db.query(
+    `UPDATE wagers SET status = 'CASHED_OUT', maker_remaining = 0, opponent_remaining = 0,
+       maker_final_balance = $3, opponent_final_balance = $4,
+       chain_signature = $2, settlement_signature = $2
+     WHERE wager_id = $1 AND status = 'CASHING_OUT'`,
+    [event.wagerId, cashOut.signature, makerBalance.toString(), opponentBalance.toString()]
+  );
+  if (row.game === "QUAKE3" && row.quake_maker_handle && row.quake_opponent_handle) {
+    const solUsdPrice = await solPriceFor(row.asset);
+    await notifyQuake3(
+      event.wagerId,
+      "cash-out",
+      () => cashOutNotificationPlan({
+        makerName: row.quake_maker_handle!,
+        opponentName: row.quake_opponent_handle!,
+        makerBalance,
+        opponentBalance,
+        asset: row.asset,
+        solUsdPrice,
+        makerClientNum: row.maker_client_num,
+        opponentClientNum: row.opponent_client_num
+      })
+    );
+  }
+  return cashOut.signature;
 };
 
 const chainWorker = new Worker<ChainAction>(
   config.queueName,
-  async (job: Job<ChainAction>) => job.name === "settle-kill"
-    ? processKillPayout(job.data as KillPayoutEvent)
-    : processWinner(job.data as WinnerEvent),
+  async (job: Job<ChainAction>) => job.name === "settle-increment"
+    ? processIncrementPayout(job.data as IncrementPayoutEvent)
+    : job.name === "cash-out"
+      ? processCashOut(job.data as CashOutEvent)
+      : processWinner(job.data as WinnerEvent),
   { connection: redisConnection(), concurrency: 1 }
 );
 
 const close = async () => {
+  quake3Notifications.close();
   await Promise.all([
     gameWorker.close(),
     chainWorker.close(),

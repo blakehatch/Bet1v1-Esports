@@ -15,6 +15,9 @@ target
 node_modules
 dist
 .env
+/bet1v1-solana-program/chain-automation-keypair.json
+/bet1v1-solana-program/localnet-*-mint-keypair.json
+/bet1v1-solana-program/devnet-*-mint-keypair.json
 .DS_Store
 cs2-data
 bet1v1-quake-3-js-server/baseq3/*.pk3

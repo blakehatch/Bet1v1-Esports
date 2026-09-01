@@ -41,6 +41,10 @@ pub struct StakeTokens<'info> {
 }
 
 pub fn stake_tokens(ctx: Context<StakeTokens>, amount: u64) -> Result<()> {
+    require!(
+        ctx.accounts.config.staking_enabled,
+        WagerError::StakingDisabled
+    );
     require!(amount > 0, WagerError::InvalidWagerAmount);
     let stake = &mut ctx.accounts.stake;
     if stake.owner == Pubkey::default() {

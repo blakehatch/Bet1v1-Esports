@@ -8,15 +8,28 @@ const required = (name: string, fallback?: string) => {
   return value;
 };
 
+const enabled = (name: string, fallback = true) =>
+  (process.env[name] ?? String(fallback)).toLowerCase() === "true";
+
+const positiveBigInt = (name: string, fallback: string) => {
+  const value = BigInt(process.env[name] ?? fallback);
+  if (value < 1n) throw new Error(`${name} must be at least 1`);
+  return value;
+};
+
 export const config = {
   port: Number(process.env.PORT ?? 3001),
   databaseUrl: required("DATABASE_URL", "postgres://bet1v1:bet1v1@localhost:5432/bet1v1"),
   redisUrl: required("REDIS_URL", "redis://localhost:6379"),
   rpcUrl: required("SOLANA_RPC_URL", "http://127.0.0.1:8899"),
-  programId: required("PROGRAM_ID", "6L4UuN5zYFaZsLffmUuNKk9d5BtzusyK1xE5Z8Wr2CUY"),
+  programId: required("PROGRAM_ID", "8rqv4B1Sw4xweu4kWEHGnqoTQbQvRKuxSturDsz32i4v"),
   tokenMint: required("TOKEN_MINT", "So11111111111111111111111111111111111111112"),
+  usdcMint: required("USDC_MINT", "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"),
   chainAuthoritySecret: process.env.CHAIN_AUTHORITY_SECRET ?? "",
-  mockChain: process.env.MOCK_CHAIN !== "false",
+  chainAuthorityKeypair: process.env.CHAIN_AUTHORITY_KEYPAIR ?? "",
+  mockChain: enabled("MOCK_CHAIN"),
+  stakingEnabled: enabled("STAKING_ENABLED", false),
+  wagerIdFloor: positiveBigInt("WAGER_ID_FLOOR", "1"),
   mockRequiredStake: BigInt(process.env.MOCK_REQUIRED_STAKE ?? "1000000000"),
   adminKey: required("ADMIN_KEY", "local-admin"),
   winnerChannel: "cs2:winners",
@@ -27,6 +40,7 @@ export const config = {
   quake3ServerAddress: process.env.QUAKE3_SERVER_ADDRESS ?? "127.0.0.1:27961",
   quake3StatusHost: process.env.QUAKE3_STATUS_HOST ?? "127.0.0.1",
   quake3StatusPort: Number(process.env.QUAKE3_STATUS_PORT ?? 27960),
+  quake3RconPassword: process.env.Q3JS_RCON_PASSWORD ?? "",
   quake3FragLimit: Number(process.env.QUAKE3_FRAG_LIMIT ?? 10),
   quake3EventSecret: required(
     "Q3JS_EVENT_CLIENT_SECRET",

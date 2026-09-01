@@ -41,7 +41,7 @@ pub struct SettleWager<'info> {
         token::authority = wager
     )]
     pub wager_vault: Account<'info, TokenAccount>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
         mut,

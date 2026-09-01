@@ -34,6 +34,23 @@ export const validEventSecret = (candidate: unknown) => {
 
 export type Quake3Score = { score: number; ping: number; name: string };
 
+export type Quake3Identity = {
+  playerName: string;
+  playUrl: string;
+  connected: boolean;
+  clientNum: number | null;
+};
+
+type Quake3IdentityRow = {
+  game?: unknown;
+  maker?: unknown;
+  opponent?: unknown;
+  quake_maker_handle?: unknown;
+  quake_opponent_handle?: unknown;
+  maker_client_num?: unknown;
+  opponent_client_num?: unknown;
+};
+
 export const killPayout = (killValue: bigint, victimRemaining: bigint) =>
   killValue < victimRemaining ? killValue : victimRemaining;
 
@@ -85,4 +102,26 @@ export const quake3PlayUrl = (playerName: string) => {
   url.searchParams.set("voice", "0");
   url.searchParams.set("fsGame", "q3js");
   return url.toString();
+};
+
+export const quake3IdentityForWallet = (
+  row: Quake3IdentityRow,
+  wallet: string
+): Quake3Identity | null => {
+  if (row.game !== "QUAKE3") return null;
+  const maker = row.maker === wallet;
+  const opponent = row.opponent === wallet;
+  if (!maker && !opponent) return null;
+  const rawHandle = maker
+    ? row.quake_maker_handle
+    : row.quake_opponent_handle;
+  if (typeof rawHandle !== "string" || !rawHandle) return null;
+  const rawClientNum = maker ? row.maker_client_num : row.opponent_client_num;
+  const clientNum = Number.isInteger(rawClientNum) ? Number(rawClientNum) : null;
+  return {
+    playerName: rawHandle,
+    playUrl: quake3PlayUrl(rawHandle),
+    connected: clientNum !== null,
+    clientNum
+  };
 };

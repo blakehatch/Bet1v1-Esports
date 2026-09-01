@@ -4,14 +4,15 @@ import { config } from "./config.js";
 import { Quake3QueuedEvent, quake3EventSchema } from "./quake3.js";
 
 export type WinnerEvent = { wagerId: string; winner: string };
-export type KillPayoutEvent = {
+export type CashOutEvent = { wagerId: string };
+export type IncrementPayoutEvent = {
   eventId: string;
   wagerId: string;
-  killer: string;
-  victim: string;
+  beneficiary: string;
+  debitedPlayer: string;
   sequence: number;
 };
-export type ChainAction = WinnerEvent | KillPayoutEvent;
+export type ChainAction = WinnerEvent | IncrementPayoutEvent | CashOutEvent;
 
 export const redisConnection = () => new Redis(config.redisUrl, { maxRetriesPerRequest: null });
 

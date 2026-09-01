@@ -36,7 +36,7 @@ pub struct InvalidateWager<'info> {
         token::authority = wager
     )]
     pub wager_vault: Box<Account<'info, TokenAccount>>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
         mut,

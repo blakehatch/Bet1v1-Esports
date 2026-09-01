@@ -18,16 +18,26 @@ pub struct InitializeConfig<'info> {
     pub authority: Signer<'info>,
     pub chain_authority: Signer<'info>,
     pub token_mint: Account<'info, Mint>,
+    pub usdc_mint: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
 }
 
-pub fn initialize_config(ctx: Context<InitializeConfig>, required_stake: u64) -> Result<()> {
-    require!(required_stake > 0, WagerError::InvalidWagerAmount);
+pub fn initialize_config(
+    ctx: Context<InitializeConfig>,
+    required_stake: u64,
+    staking_enabled: bool,
+) -> Result<()> {
+    require!(
+        !staking_enabled || required_stake > 0,
+        WagerError::InvalidWagerAmount
+    );
     let config = &mut ctx.accounts.config;
     config.authority = ctx.accounts.authority.key();
     config.chain_authority = ctx.accounts.chain_authority.key();
     config.token_mint = ctx.accounts.token_mint.key();
+    config.usdc_mint = ctx.accounts.usdc_mint.key();
     config.required_stake = required_stake;
+    config.staking_enabled = staking_enabled;
     config.bump = ctx.bumps.config;
     Ok(())
 }
@@ -49,11 +59,16 @@ pub fn update_config(
     authority: Pubkey,
     chain_authority: Pubkey,
     required_stake: u64,
+    staking_enabled: bool,
 ) -> Result<()> {
-    require!(required_stake > 0, WagerError::InvalidWagerAmount);
+    require!(
+        !staking_enabled || required_stake > 0,
+        WagerError::InvalidWagerAmount
+    );
     let config = &mut ctx.accounts.config;
     config.authority = authority;
     config.chain_authority = chain_authority;
     config.required_stake = required_stake;
+    config.staking_enabled = staking_enabled;
     Ok(())
 }

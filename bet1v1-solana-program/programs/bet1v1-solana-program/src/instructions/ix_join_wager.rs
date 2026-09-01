@@ -1,5 +1,5 @@
-use crate::constant::{seeds, MATCHED, OPEN};
-use crate::errors::WagerError;
+use super::wager_helpers::{match_wager, validate_join};
+use crate::constant::seeds;
 use crate::event::WagerMatchedEvent;
 use crate::state::{Config, UserStake, Wager};
 use anchor_lang::prelude::*;
@@ -10,10 +10,12 @@ pub struct JoinWager<'info> {
     #[account(seeds = [seeds::CONFIG], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(
-        mut,
+        init_if_needed,
+        payer = opponent,
+        space = 8 + UserStake::INIT_SPACE,
         seeds = [seeds::STAKE, opponent.key().as_ref()],
-        bump = opponent_stake.bump,
-        constraint = opponent_stake.owner == opponent.key()
+        bump,
+        constraint = opponent_stake.owner == Pubkey::default() || opponent_stake.owner == opponent.key()
     )]
     pub opponent_stake: Account<'info, UserStake>,
     #[account(
@@ -30,7 +32,7 @@ pub struct JoinWager<'info> {
         token::authority = wager
     )]
     pub wager_vault: Account<'info, TokenAccount>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -41,25 +43,19 @@ pub struct JoinWager<'info> {
     #[account(mut)]
     pub opponent: Signer<'info>,
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 pub fn join_wager(ctx: Context<JoinWager>) -> Result<()> {
-    require!(ctx.accounts.wager.status == OPEN, WagerError::WagerNotOpen);
-    require_keys_neq!(
-        ctx.accounts.wager.maker,
+    let opponent_stake = &mut ctx.accounts.opponent_stake;
+    validate_join(
+        &ctx.accounts.wager,
         ctx.accounts.opponent.key(),
-        WagerError::InvalidWagerParticipants
-    );
-    require!(
-        ctx.accounts.wager.challenger == Pubkey::default()
-            || ctx.accounts.wager.challenger == ctx.accounts.opponent.key(),
-        WagerError::WagerReserved
-    );
-    require!(!ctx.accounts.opponent_stake.banned, WagerError::UserBanned);
-    require!(
-        ctx.accounts.opponent_stake.amount >= ctx.accounts.config.required_stake,
-        WagerError::StakeRequired
-    );
+        opponent_stake,
+        ctx.bumps.opponent_stake,
+        &ctx.accounts.config,
+    )?;
     token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
@@ -71,14 +67,11 @@ pub fn join_wager(ctx: Context<JoinWager>) -> Result<()> {
         ),
         ctx.accounts.wager.amount,
     )?;
-    ctx.accounts.wager.opponent = ctx.accounts.opponent.key();
-    ctx.accounts.wager.status = MATCHED;
-    ctx.accounts.opponent_stake.active_wagers = ctx
-        .accounts
-        .opponent_stake
-        .active_wagers
-        .checked_add(1)
-        .ok_or(WagerError::MathOverflow)?;
+    match_wager(
+        &mut ctx.accounts.wager,
+        opponent_stake,
+        ctx.accounts.opponent.key(),
+    )?;
     emit!(WagerMatchedEvent {
         wager_id: ctx.accounts.wager.wager_id,
         maker: ctx.accounts.wager.maker,

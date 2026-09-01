@@ -3,7 +3,7 @@ pub const MATCHED: u8 = 1;
 pub const SETTLED: u8 = 2;
 pub const CANCELLED: u8 = 3;
 pub const WINNER_TAKE_ALL: u8 = 0;
-pub const PER_KILL: u8 = 1;
+pub const INCREMENTAL: u8 = 1;
 
 pub mod seeds {
     pub const CONFIG: &[u8] = b"config";

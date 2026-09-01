@@ -6,6 +6,8 @@ pub struct Config {
     pub authority: Pubkey,
     pub chain_authority: Pubkey,
     pub token_mint: Pubkey,
+    pub usdc_mint: Pubkey,
     pub required_stake: u64,
+    pub staking_enabled: bool,
     pub bump: u8,
 }

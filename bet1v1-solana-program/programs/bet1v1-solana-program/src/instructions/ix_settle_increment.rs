@@ -1,12 +1,12 @@
-use crate::constant::{seeds, MATCHED, PER_KILL, SETTLED};
+use crate::constant::{seeds, INCREMENTAL, MATCHED, SETTLED};
 use crate::errors::WagerError;
-use crate::event::{KillPaidEvent, WagerSettledEvent};
+use crate::event::{IncrementPaidEvent, WagerSettledEvent};
 use crate::state::{Config, UserStake, Wager};
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 #[derive(Accounts)]
-pub struct SettleKill<'info> {
+pub struct SettleIncrement<'info> {
     #[account(seeds = [seeds::CONFIG], bump = config.bump, has_one = chain_authority)]
     pub config: Account<'info, Config>,
     #[account(mut, seeds = [seeds::WAGER, &wager.wager_id.to_le_bytes()], bump = wager.bump)]
@@ -33,7 +33,7 @@ pub struct SettleKill<'info> {
         token::authority = wager
     )]
     pub wager_vault: Account<'info, TokenAccount>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(mut, token::mint = token_mint, constraint = maker_token.owner == wager.maker)]
     pub maker_token: Account<'info, TokenAccount>,
@@ -43,53 +43,60 @@ pub struct SettleKill<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> Result<()> {
+pub fn settle_increment(
+    ctx: Context<SettleIncrement>,
+    beneficiary: Pubkey,
+    sequence: u32,
+) -> Result<()> {
     let wager = &ctx.accounts.wager;
     require!(wager.status == MATCHED, WagerError::WagerNotMatched);
-    require!(wager.payout_mode == PER_KILL, WagerError::InvalidPayoutMode);
     require!(
-        killer == wager.maker || killer == wager.opponent,
+        wager.payout_mode == INCREMENTAL,
+        WagerError::InvalidPayoutMode
+    );
+    require!(
+        beneficiary == wager.maker || beneficiary == wager.opponent,
         WagerError::InvalidWagerWinner
     );
     let expected_sequence = wager
-        .maker_kills
-        .checked_add(wager.opponent_kills)
+        .maker_score
+        .checked_add(wager.opponent_score)
         .and_then(|value| value.checked_add(1))
         .ok_or(WagerError::MathOverflow)?;
     require!(
         sequence == expected_sequence,
-        WagerError::InvalidKillSequence
+        WagerError::InvalidScoreSequence
     );
 
-    let killer_is_maker = killer == wager.maker;
-    let victim = if killer_is_maker {
+    let beneficiary_is_maker = beneficiary == wager.maker;
+    let debited_player = if beneficiary_is_maker {
         wager.opponent
     } else {
         wager.maker
     };
-    let victim_remaining = if killer_is_maker {
+    let debited_remaining = if beneficiary_is_maker {
         wager.opponent_remaining
     } else {
         wager.maker_remaining
     };
-    let killer_remaining = if killer_is_maker {
+    let beneficiary_remaining = if beneficiary_is_maker {
         wager.maker_remaining
     } else {
         wager.opponent_remaining
     };
-    let payout = wager.kill_value.min(victim_remaining);
-    require!(payout > 0, WagerError::InvalidKillValue);
-    let settled = payout == victim_remaining;
+    let payout = wager.increment_value.min(debited_remaining);
+    require!(payout > 0, WagerError::InvalidIncrementValue);
+    let settled = payout == debited_remaining;
     let transfer_amount = if settled {
         payout
-            .checked_add(killer_remaining)
+            .checked_add(beneficiary_remaining)
             .ok_or(WagerError::MathOverflow)?
     } else {
         payout
     };
     let wager_id = wager.wager_id.to_le_bytes();
     let signer_seeds: &[&[u8]] = &[seeds::WAGER, &wager_id, &[wager.bump]];
-    let destination = if killer_is_maker {
+    let destination = if beneficiary_is_maker {
         ctx.accounts.maker_token.to_account_info()
     } else {
         ctx.accounts.opponent_token.to_account_info()
@@ -108,9 +115,9 @@ pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> R
     )?;
 
     let wager = &mut ctx.accounts.wager;
-    if killer_is_maker {
-        wager.maker_kills = wager
-            .maker_kills
+    if beneficiary_is_maker {
+        wager.maker_score = wager
+            .maker_score
             .checked_add(1)
             .ok_or(WagerError::MathOverflow)?;
         wager.opponent_remaining = wager
@@ -118,8 +125,8 @@ pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> R
             .checked_sub(payout)
             .ok_or(WagerError::MathOverflow)?;
     } else {
-        wager.opponent_kills = wager
-            .opponent_kills
+        wager.opponent_score = wager
+            .opponent_score
             .checked_add(1)
             .ok_or(WagerError::MathOverflow)?;
         wager.maker_remaining = wager
@@ -130,7 +137,7 @@ pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> R
     if settled {
         wager.maker_remaining = 0;
         wager.opponent_remaining = 0;
-        wager.winner = killer;
+        wager.winner = beneficiary;
         wager.status = SETTLED;
         ctx.accounts.maker_stake.active_wagers = ctx
             .accounts
@@ -146,14 +153,14 @@ pub fn settle_kill(ctx: Context<SettleKill>, killer: Pubkey, sequence: u32) -> R
             .ok_or(WagerError::MathOverflow)?;
         emit!(WagerSettledEvent {
             wager_id: wager.wager_id,
-            winner: killer,
+            winner: beneficiary,
             payout: transfer_amount
         });
     }
-    emit!(KillPaidEvent {
+    emit!(IncrementPaidEvent {
         wager_id: wager.wager_id,
-        killer,
-        victim,
+        beneficiary,
+        debited_player,
         amount: payout,
         sequence,
         settled,

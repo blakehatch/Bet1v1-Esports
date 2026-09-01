@@ -12,6 +12,7 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -22,6 +23,7 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   api:
     build: ./api
@@ -30,10 +32,12 @@ services:
       DATABASE_URL: postgres://bet1v1:${POSTGRES_PASSWORD:-bet1v1}@postgres:5432/bet1v1
       REDIS_URL: redis://redis:6379
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-http://host.docker.internal:8899}
-      PROGRAM_ID: ${PROGRAM_ID:-6L4UuN5zYFaZsLffmUuNKk9d5BtzusyK1xE5Z8Wr2CUY}
+      PROGRAM_ID: ${PROGRAM_ID:-8rqv4B1Sw4xweu4kWEHGnqoTQbQvRKuxSturDsz32i4v}
       TOKEN_MINT: ${TOKEN_MINT:-So11111111111111111111111111111111111111112}
-      CHAIN_AUTHORITY_SECRET: ${CHAIN_AUTHORITY_SECRET:-}
+      USDC_MINT: ${USDC_MINT:-4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU}
       MOCK_CHAIN: ${MOCK_CHAIN:-true}
+      STAKING_ENABLED: ${STAKING_ENABLED:-false}
+      WAGER_ID_FLOOR: ${WAGER_ID_FLOOR:-1}
       MOCK_REQUIRED_STAKE: ${MOCK_REQUIRED_STAKE:-1000000000}
       ADMIN_KEY: ${ADMIN_KEY:-local-admin}
       CS2_SERVER_ADDRESS: ${CS2_SERVER_ADDRESS:-127.0.0.1:27015}
@@ -54,16 +58,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   worker:
     build: ./api
     command: ["node", "dist/worker.js"]
-    environment: *api-environment
+    environment:
+      <<: *api-environment
+      CHAIN_AUTHORITY_SECRET: ${CHAIN_AUTHORITY_SECRET:-}
+      CHAIN_AUTHORITY_KEYPAIR: /run/secrets/chain-automation-keypair.json
+      Q3JS_RCON_PASSWORD: ${Q3JS_RCON_PASSWORD:-}
+    volumes:
+      - ./bet1v1-solana-program/chain-automation-keypair.json:/run/secrets/chain-automation-keypair.json:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    restart: unless-stopped
 
   app:
     build:
@@ -77,6 +89,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
   cs2:
     profiles: ["cs2"]
@@ -113,6 +126,7 @@ services:
       Q3JS_MASTER_URL: ${Q3JS_MASTER_URL:-http://127.0.0.1:8080}
       Q3JS_EVENT_URL: http://api:3001/q3/events
       Q3JS_EVENT_CLIENT_SECRET: ${Q3JS_EVENT_CLIENT_SECRET:-bet1v1-q3-local-event-secret-change-me}
+      Q3JS_RCON_PASSWORD: ${Q3JS_RCON_PASSWORD:-}
       Q3JS_PUBLISH_HOST: ${Q3JS_PUBLISH_HOST:-localhost}
       Q3JS_PUBLISH_PORT: ${Q3JS_PUBLISH_PORT:-27961}
       Q3JS_SECURE: ${Q3JS_SECURE:-false}

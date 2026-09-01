@@ -7,30 +7,50 @@ import {
   Transaction,
   TransactionInstruction
 } from "@solana/web3.js";
+import { AddressType, BrowserSDK, waitForPhantomExtension } from "@phantom/browser-sdk";
 import { Buffer } from "buffer";
 
-type Phantom = {
-  publicKey?: PublicKey;
-  connect: () => Promise<{ publicKey: PublicKey }>;
-  signMessage: (message: Uint8Array, display?: "utf8" | "hex") => Promise<{ signature: Uint8Array }>;
-  signAndSendTransaction: (transaction: Transaction) => Promise<{ signature: string }>;
+type InjectedPhantomProvider = {
+  isPhantom?: boolean;
+  isConnected?: boolean;
+  publicKey?: PublicKey | null;
+  request?: (request: {
+    method: "connect";
+    params?: { onlyIfTrusted?: boolean };
+  }) => Promise<{ publicKey?: PublicKey }>;
+  signMessage?: (
+    message: Uint8Array,
+    display?: "utf8" | "hex"
+  ) => Promise<{ signature: Uint8Array }>;
+  signTransaction?: (transaction: Transaction) => Promise<Transaction>;
+  signAndSendTransaction?: (transaction: Transaction) => Promise<{ signature: string }>;
 };
 
 declare global {
   interface Window {
-    solana?: Phantom;
+    solana?: InjectedPhantomProvider;
   }
 }
+
+type Quake3Identity = {
+  playerName: string;
+  playUrl: string;
+  connected: boolean;
+  clientNum: number | null;
+};
 
 type AppConfig = {
   programId: string;
   tokenMint: string;
+  usdcMint: string;
   mockChain: boolean;
+  stakingEnabled: boolean;
   serverAddress: string;
   quake3ServerAddress: string;
 };
 
 type Game = "CS2" | "QUAKE3";
+type WagerAsset = "SOL" | "USDC";
 
 type Access = {
   amount: string;
@@ -39,29 +59,49 @@ type Access = {
   active: boolean;
 };
 
+type Account = {
+  wallet: string;
+  username: string | null;
+};
+
 type Wager = {
   wagerId: string;
   maker: string;
   challenger: string | null;
   opponent: string | null;
   amount: string;
+  asset: WagerAsset;
   game: Game;
   status: string;
   serverAddress: string | null;
   winner: string | null;
-  payoutMode: "WINNER_TAKE_ALL" | "PER_KILL";
+  chainSignature?: string | null;
+  createSignature?: string | null;
+  joinSignature?: string | null;
+  settlementSignature?: string | null;
+  payoutMode: "WINNER_TAKE_ALL" | "INCREMENTAL";
   fragLimit: number;
-  killValue: string;
+  incrementValue: string;
   makerRemaining: string;
   opponentRemaining: string;
   makerScore: number;
   opponentScore: number;
-  quake3Identity?: { playerName: string; playUrl: string };
+  cashoutRequestedBy?: string | null;
+  cashoutRequestedAt?: string | null;
+  makerFinalBalance?: string | null;
+  opponentFinalBalance?: string | null;
+  createdAt: string;
+  quake3Identity?: Quake3Identity;
 };
 
 const apiUrl = import.meta.env.VITE_API_URL ?? "/api";
-const decimals = Number(import.meta.env.VITE_TOKEN_DECIMALS ?? 9);
+const stakeDecimals = Number(import.meta.env.VITE_TOKEN_DECIMALS ?? 9);
+const assetDecimals = (asset: WagerAsset) => asset === "SOL" ? 9 : 6;
 const connection = new Connection(import.meta.env.VITE_SOLANA_RPC_URL ?? "http://127.0.0.1:8899", "confirmed");
+const phantom = new BrowserSDK({
+  providers: ["injected"],
+  addressTypes: [AddressType.solana]
+});
 const tokenProgramId = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const associatedTokenProgramId = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 let walletAddress = "";
@@ -69,6 +109,11 @@ let appConfig: AppConfig;
 let selectedGame: Game | null = null;
 let accessActive = false;
 let authToken = "";
+let injectedPhantom: InjectedPhantomProvider | null = null;
+let solUsdPrice: number | null = null;
+let accountUsername = "";
+let usernameSetupPending = false;
+const quake3Identities = new Map<string, Quake3Identity>();
 
 const root = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -81,7 +126,11 @@ root.innerHTML = `
     </a>
     <div class="network-status"><i></i> SOLANA DEVNET</div>
     <div class="wallet-actions">
-      <span class="wallet" id="wallet">WALLET DISCONNECTED</span>
+      <div class="wallet-summary">
+        <span class="wallet" id="wallet">WALLET DISCONNECTED</span>
+        <span class="wallet-balance" id="wallet-balances">SOL -- · USDC --</span>
+      </div>
+      <button class="secondary compact account-button hidden" id="account-settings" type="button">ACCOUNT <span id="account-name"></span></button>
       <button class="connect-button" id="connect">CONNECT WALLET</button>
     </div>
   </header>
@@ -92,7 +141,7 @@ root.innerHTML = `
       <div class="hero-copy">
         <h1><span>Bet</span><em>1v1</em></h1>
         <div class="protocol-label"><b>P2P 1V1</b> ESPORTS WAGERING PROTOCOL</div>
-        <p>Stake $B1V1. Choose your arena. Challenge a rival.</p>
+        <p id="hero-tagline">Choose your arena. Challenge a rival.</p>
         <div class="solana-lockup"><i><span></span><span></span><span></span></i> ON <b>SOLANA</b></div>
       </div>
       <div class="hero-footer"><span>WAGER P2P</span><i></i><span>1V1 DUELS</span><i></i><span>ON-CHAIN ESCROW</span><i></i><span>FAST FINALITY</span></div>
@@ -120,7 +169,7 @@ root.innerHTML = `
       </div>
     </section>
 
-    <section class="access-panel card">
+    <section class="access-panel card hidden" id="access-panel">
       <div class="access-copy">
         <div class="section-kicker">02 // ACCESS PROTOCOL</div>
         <div class="row between"><h2>Stake to compete</h2><span class="pill" id="access-status">LOCKED</span></div>
@@ -149,20 +198,57 @@ root.innerHTML = `
         </div>
         <div id="friends" class="stack"><span class="empty">No friends yet.</span></div>
       </article>
-      <article class="card stack">
+      <article class="card stack wager-form">
         <div class="card-heading"><span class="card-icon">◇</span><div><small>ON-CHAIN ESCROW</small><h3>New wager</h3></div></div>
-        <label for="wager-amount">WAGER PER PLAYER</label>
-        <input id="wager-amount" type="number" min="0" step="0.000000001" value="0.1" aria-label="Wager amount" />
-        <label for="payout-mode">PAYOUT MODE</label>
-        <select id="payout-mode" aria-label="Payout mode">
-          <option value="WINNER_TAKE_ALL">Winner takes the match pot</option>
-          <option value="PER_KILL">Configurable payout per kill</option>
-        </select>
-        <label for="frag-limit">Q3 FRAG LIMIT (MATCH MODE)</label>
-        <input id="frag-limit" type="number" min="1" max="100" step="1" value="10" aria-label="Quake frag limit" />
-        <label for="kill-value">$B1V1 PER KILL</label>
-        <input id="kill-value" type="number" min="0" step="0.000000001" value="0.005" aria-label="Per kill amount" disabled />
-        <input id="challenger" placeholder="Friend wallet or blank for random" aria-label="Challenger wallet" />
+        <div class="form-block">
+          <div class="field-heading"><span>WAGER ASSET</span><small>ESCROW CURRENCY</small></div>
+          <div class="choice-grid asset-choices" role="radiogroup" aria-label="Wager asset">
+            <label class="choice-card">
+              <input type="radio" name="wager-asset" value="SOL" checked />
+              <span class="choice-symbol sol-symbol">◎</span>
+              <span><strong>SOL</strong><small>Native Solana</small></span>
+            </label>
+            <label class="choice-card">
+              <input type="radio" name="wager-asset" value="USDC" />
+              <span class="choice-symbol usdc-symbol">$</span>
+              <span><strong>USDC</strong><small>Stable test token</small></span>
+            </label>
+          </div>
+        </div>
+        <div class="form-block">
+          <div class="field-heading"><label for="wager-amount">WAGER PER PLAYER</label><small id="wager-unit">SOL</small></div>
+          <input id="wager-amount" type="number" min="0" step="0.000000001" value="0.1" aria-label="Wager amount" />
+          <p class="field-hint" id="wager-usd-estimate">Loading SOL price…</p>
+        </div>
+        <div class="form-block">
+          <div class="field-heading"><span>PAYOUT STRUCTURE</span><small>HOW THE POT MOVES</small></div>
+          <div class="choice-grid payout-choices" role="radiogroup" aria-label="Payout mode">
+            <label class="choice-card payout-card">
+              <input type="radio" name="payout-mode" value="WINNER_TAKE_ALL" checked />
+              <span><strong>Winner takes all</strong><small>Entire match pot settles once</small></span>
+              <b>FULL POT</b>
+            </label>
+            <label class="choice-card payout-card" id="incremental-choice">
+              <input id="incremental-mode" type="radio" name="payout-mode" value="INCREMENTAL" />
+              <span><strong>Per scoring event</strong><small>Balance moves live as points land</small></span>
+              <b>Q3 LIVE</b>
+            </label>
+          </div>
+          <p class="mode-help" id="payout-help">Choose Quake III to unlock live per-score payouts in SOL or USDC.</p>
+        </div>
+        <div class="conditional-fields" id="frag-limit-fields">
+          <div class="field-heading"><label for="frag-limit">MATCH FRAG LIMIT</label><small>Q3 SERVER: 10</small></div>
+          <input id="frag-limit" type="number" min="1" max="100" step="1" value="10" aria-label="Quake frag limit" />
+        </div>
+        <div class="conditional-fields hidden" id="increment-fields">
+          <div class="field-heading"><label for="increment-value">PAYOUT PER SCORING EVENT</label><small id="increment-unit">USDC</small></div>
+          <input id="increment-value" type="number" min="0" step="0.000001" value="0.005" aria-label="Incremental payout amount" disabled />
+          <p class="field-hint">Each verified score transfers this amount from the opponent's remaining escrow.</p>
+        </div>
+        <div class="form-block">
+          <div class="field-heading"><label for="challenger">OPPONENT</label><small>OPTIONAL</small></div>
+          <input id="challenger" placeholder="Friend wallet or blank for an open challenge" aria-label="Challenger wallet" />
+        </div>
         <button id="create-wager" disabled>CREATE CHALLENGE</button>
       </article>
     </section>
@@ -172,8 +258,15 @@ root.innerHTML = `
         <div id="open-wagers"><span class="empty">No open wagers.</span></div>
       </article>
       <article class="card">
-        <div class="card-heading"><span class="card-icon">×</span><div><small>PLAYER RECORD</small><h3>Your matches</h3></div></div>
+        <div class="row between match-card-heading">
+          <div class="card-heading"><span class="card-icon">×</span><div><small>PLAYER RECORD</small><h3>Your challenges</h3></div></div>
+          <button class="secondary compact" id="toggle-history" type="button">HISTORY <span id="history-count">0</span></button>
+        </div>
         <div id="my-wagers"><span class="empty">Connect a wallet.</span></div>
+        <div id="challenge-history" class="history-panel hidden">
+          <div class="history-heading"><strong>CHALLENGE HISTORY</strong><span>Older challenges</span></div>
+          <div id="history-wagers"><span class="empty">No challenge history.</span></div>
+        </div>
       </article>
     </section>
     <section class="card admin-card section-space">
@@ -184,14 +277,57 @@ root.innerHTML = `
   </main>
   <footer><span>BET1V1 // PUBLIC BUILD</span><span>POWERED BY SOLANA</span></footer>
   <div id="notice" class="hidden"></div>
+  <div id="username-modal" class="account-modal hidden" role="dialog" aria-modal="true" aria-labelledby="username-title">
+    <form id="username-form" class="account-dialog">
+      <div class="section-kicker" id="username-kicker">PLAYER IDENTITY</div>
+      <h2 id="username-title">Choose your game name</h2>
+      <p>This name is tied to your wallet and used inside Quake and payout messages. You can change it later; active matches keep their current identity.</p>
+      <label for="username-input">USERNAME</label>
+      <input id="username-input" minlength="3" maxlength="16" autocomplete="nickname" placeholder="RocketQueen" required />
+      <small>3–16 characters · letters, numbers, underscores, or hyphens</small>
+      <p class="username-error hidden" id="username-error"></p>
+      <div class="row username-actions">
+        <button id="save-username" type="submit">SAVE USERNAME</button>
+        <button class="secondary" id="cancel-username" type="button">CANCEL</button>
+      </div>
+    </form>
+  </div>
 `;
 
 const element = <T extends HTMLElement>(id: string) => document.querySelector<T>(`#${id}`)!;
-const notice = (message: string) => {
+let noticeTimer = 0;
+const notice = (message: string, signature?: string, duration = 5_000) => {
   const item = element<HTMLDivElement>("notice");
-  item.textContent = message;
+  window.clearTimeout(noticeTimer);
+  const copy = document.createElement("span");
+  copy.textContent = message;
+  item.replaceChildren(copy);
+  if (signature) {
+    const link = document.createElement("a");
+    link.href = `https://solscan.io/tx/${signature}?cluster=devnet`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "VIEW ON SOLSCAN ↗";
+    item.append(link);
+  }
   item.classList.remove("hidden");
-  window.setTimeout(() => item.classList.add("hidden"), 3500);
+  noticeTimer = window.setTimeout(() => item.classList.add("hidden"), duration);
+};
+
+const showUsernameSettings = (required: boolean) => {
+  usernameSetupPending = required;
+  element("username-kicker").textContent = required ? "ONE-TIME PLAYER SETUP" : "ACCOUNT SETTINGS";
+  element("username-title").textContent = required ? "Choose your game name" : "Change your game name";
+  element<HTMLInputElement>("username-input").value = accountUsername;
+  element("username-error").classList.add("hidden");
+  element<HTMLButtonElement>("cancel-username").classList.toggle("hidden", required);
+  element("username-modal").classList.remove("hidden");
+  window.setTimeout(() => element<HTMLInputElement>("username-input").focus(), 0);
+};
+
+const hideUsernameSettings = () => {
+  if (usernameSetupPending) return;
+  element("username-modal").classList.add("hidden");
 };
 
 const api = async <T>(path: string, init?: RequestInit) => {
@@ -210,26 +346,57 @@ const api = async <T>(path: string, init?: RequestInit) => {
   return body;
 };
 
-const rawAmount = (value: string) => {
+const rawAmount = (value: string, decimals: number) => {
   const [whole = "0", fraction = ""] = value.split(".");
   return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, "0").slice(0, decimals) || "0");
 };
 
-const displayAmount = (value: string) => {
+const checkedValue = <T extends string>(name: string) =>
+  document.querySelector<HTMLInputElement>(`input[name="${name}"]:checked`)!.value as T;
+
+const displayAmount = (value: string, decimals: number) => {
   const unit = 10 ** decimals;
   return (Number(value) / unit).toLocaleString(undefined, { maximumFractionDigits: decimals });
 };
 
+const solUsdEstimate = (lamports: bigint) => solUsdPrice
+  ? ` (~$${(Number(lamports) / 1_000_000_000 * solUsdPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })})`
+  : "";
+
+const liveWagerBalances = (wager: Wager) => {
+  const bankroll = BigInt(wager.amount);
+  if (wager.status === "CASHED_OUT" && wager.makerFinalBalance != null && wager.opponentFinalBalance != null) {
+    return {
+      maker: BigInt(wager.makerFinalBalance),
+      opponent: BigInt(wager.opponentFinalBalance)
+    };
+  }
+  if (wager.status === "SETTLED" && wager.winner) {
+    return wager.winner === wager.maker
+      ? { maker: bankroll * 2n, opponent: 0n }
+      : { maker: 0n, opponent: bankroll * 2n };
+  }
+  if (!["MATCHED", "SETTLING"].includes(wager.status)) return null;
+  const makerRemaining = BigInt(wager.makerRemaining);
+  const opponentRemaining = BigInt(wager.opponentRemaining);
+  return {
+    maker: makerRemaining + (bankroll - opponentRemaining),
+    opponent: opponentRemaining + (bankroll - makerRemaining)
+  };
+};
+
 const gameName = (game: Game) => game === "CS2" ? "Counter-Strike 2" : "Quake III Arena";
-const identityKey = (wagerId: string) => `bet1v1:q3:${walletAddress}:${wagerId}`;
 const rememberIdentity = (wager: Wager) => {
-  if (wager.quake3Identity) localStorage.setItem(identityKey(wager.wagerId), JSON.stringify(wager.quake3Identity));
+  if (wager.quake3Identity) quake3Identities.set(wager.wagerId, wager.quake3Identity);
 };
-const playUrl = (wagerId: string) => {
-  const value = localStorage.getItem(identityKey(wagerId));
-  if (!value) return undefined;
-  try { return (JSON.parse(value) as { playUrl?: string }).playUrl; } catch { return undefined; }
+const loadQuake3Identity = async (wagerId: string) => {
+  const identity = await api<Quake3Identity & { wagerId: string }>(
+    `/wagers/${wagerId}/quake3-identity?wallet=${encodeURIComponent(walletAddress)}`
+  );
+  quake3Identities.set(wagerId, identity);
+  return identity;
 };
+const playUrl = (wagerId: string) => quake3Identities.get(wagerId)?.playUrl;
 
 const u64 = (value: bigint) => {
   const bytes = new Uint8Array(8);
@@ -257,18 +424,72 @@ const pda = (seeds: Uint8Array[], programId: PublicKey) =>
 const associatedTokenAddress = (mint: PublicKey, owner: PublicKey) =>
   pda([owner.toBytes(), tokenProgramId.toBytes(), mint.toBytes()], associatedTokenProgramId);
 
-const provider = () => {
-  if (!window.solana) {
-    throw new Error("Install a Solana wallet extension");
+const walletError = (error: unknown, fallback: string) => {
+  if (typeof error === "object" && error !== null) {
+    const issue = error as { code?: number; message?: string };
+    if (issue.code === 4001) return "The request was cancelled in Phantom.";
+    if (issue.message) return issue.message;
   }
-  return window.solana;
+  return fallback;
+};
+
+const connectPhantom = async () => {
+  await waitForPhantomExtension(3_000);
+  const injected = (window.phantom?.solana as InjectedPhantomProvider | undefined) ?? window.solana;
+  let injectedFailure = "";
+  if (injected?.isPhantom) {
+    if (injected.publicKey) {
+      injectedPhantom = injected;
+      return injected.publicKey;
+    }
+    if (injected.request) {
+      try {
+        const result = await injected.request({ method: "connect" });
+        const publicKey = result.publicKey ?? injected.publicKey;
+        if (!publicKey) throw new Error("Phantom returned no Solana account");
+        injectedPhantom = injected;
+        return publicKey;
+      } catch (requestError) {
+        injectedFailure = walletError(requestError, "unknown injected-provider error");
+        // Arc occasionally fails the injected JSON-RPC bridge. The Browser SDK
+        // uses Wallet Standard discovery and remains a useful second path.
+        console.warn("Phantom JSON-RPC connection failed; trying Wallet Standard", requestError);
+      }
+    }
+  }
+  try {
+    await phantom.discoverWallets();
+    const result = await phantom.connect({ provider: "injected" });
+    const address = result.addresses.find((candidate) => {
+      try {
+        new PublicKey(candidate.address);
+        return true;
+      } catch {
+        return false;
+      }
+    })?.address ?? phantom.solana.publicKey;
+    if (!address) {
+      throw new Error("Phantom connected without an active Solana account");
+    }
+    return new PublicKey(address);
+  } catch (error) {
+    const sdkFailure = walletError(error, "unknown Wallet Standard error");
+    const detail = injectedFailure
+      ? `Injected provider: ${injectedFailure}; Wallet Standard: ${sdkFailure}`
+      : sdkFailure;
+    throw new Error(
+      `Phantom could not authorize this site: ${detail}. ` +
+      "Open Phantom, unlock it, select a Solana account, and try again."
+    );
+  }
 };
 
 const authenticate = async () => {
-  const wallet = provider();
-  if (!wallet.signMessage) throw new Error("This wallet does not support message signing");
   const challenge = await api<{ nonce: string; message: string }>(`/auth/challenge/${walletAddress}`);
-  const signed = await wallet.signMessage(new TextEncoder().encode(challenge.message), "utf8");
+  const encoded = new TextEncoder().encode(challenge.message);
+  const signed = injectedPhantom?.signMessage
+    ? await injectedPhantom.signMessage(encoded, "utf8")
+    : await phantom.solana.signMessage(encoded);
   const session = await api<{ token: string }>("/auth/verify", {
     method: "POST",
     body: JSON.stringify({ wallet: walletAddress, nonce: challenge.nonce, signature: Array.from(signed.signature) })
@@ -277,17 +498,22 @@ const authenticate = async () => {
 };
 
 const send = async (instruction: TransactionInstruction) => {
-  const wallet = provider();
-  if (!wallet.publicKey) {
-    await wallet.connect();
-  }
+  const publicKey = await connectPhantom();
   const transaction = new Transaction().add(instruction);
-  transaction.feePayer = wallet.publicKey;
+  transaction.feePayer = publicKey;
   const latest = await connection.getLatestBlockhash();
   transaction.recentBlockhash = latest.blockhash;
-  const result = await wallet.signAndSendTransaction(transaction);
-  await connection.confirmTransaction({ signature: result.signature, ...latest }, "confirmed");
-  return result.signature;
+  // Phantom's active network can differ from the app's network. Ask the wallet
+  // only to sign, then submit through this app's explicitly configured RPC.
+  const signed = injectedPhantom?.signTransaction
+    ? await injectedPhantom.signTransaction(transaction)
+    : await phantom.solana.signTransaction(transaction) as Transaction;
+  const signature = await connection.sendRawTransaction(signed.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: "confirmed"
+  });
+  await connection.confirmTransaction({ signature, ...latest }, "confirmed");
+  return signature;
 };
 
 const stakeOnChain = async (amount: bigint) => {
@@ -317,18 +543,38 @@ const stakeOnChain = async (amount: bigint) => {
 
 const createWagerOnChain = async (wager: Wager) => {
   const maker = new PublicKey(walletAddress);
-  const challenger = wager.challenger ? new PublicKey(wager.challenger) : PublicKey.default;
+  const reservedFor = wager.opponent ?? wager.challenger;
+  const challenger = reservedFor ? new PublicKey(reservedFor) : PublicKey.default;
   const programId = new PublicKey(appConfig.programId);
-  const mint = new PublicKey(appConfig.tokenMint);
+  const mint = new PublicKey(appConfig.usdcMint);
   const id = u64(BigInt(wager.wagerId));
+  if (wager.asset === "SOL") {
+    return send(new TransactionInstruction({
+      programId,
+      data: await instructionData("create_sol_wager", [
+        id,
+        challenger.toBytes(),
+        u64(BigInt(wager.amount)),
+        Uint8Array.of(wager.payoutMode === "INCREMENTAL" ? 1 : 0),
+        u64(BigInt(wager.incrementValue))
+      ]),
+      keys: [
+        { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
+        { pubkey: pda([new TextEncoder().encode("stake"), maker.toBytes()], programId), isSigner: false, isWritable: true },
+        { pubkey: pda([new TextEncoder().encode("wager"), id], programId), isSigner: false, isWritable: true },
+        { pubkey: maker, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+      ]
+    }));
+  }
   return send(new TransactionInstruction({
     programId,
     data: await instructionData("create_wager", [
       id,
       challenger.toBytes(),
       u64(BigInt(wager.amount)),
-      Uint8Array.of(wager.payoutMode === "PER_KILL" ? 1 : 0),
-      u64(BigInt(wager.killValue))
+      Uint8Array.of(wager.payoutMode === "INCREMENTAL" ? 1 : 0),
+      u64(BigInt(wager.incrementValue))
     ]),
     keys: [
       { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
@@ -348,8 +594,21 @@ const createWagerOnChain = async (wager: Wager) => {
 const joinWagerOnChain = async (wager: Wager) => {
   const opponent = new PublicKey(walletAddress);
   const programId = new PublicKey(appConfig.programId);
-  const mint = new PublicKey(appConfig.tokenMint);
+  const mint = new PublicKey(appConfig.usdcMint);
   const id = u64(BigInt(wager.wagerId));
+  if (wager.asset === "SOL") {
+    return send(new TransactionInstruction({
+      programId,
+      data: await instructionData("join_sol_wager"),
+      keys: [
+        { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
+        { pubkey: pda([new TextEncoder().encode("stake"), opponent.toBytes()], programId), isSigner: false, isWritable: true },
+        { pubkey: pda([new TextEncoder().encode("wager"), id], programId), isSigner: false, isWritable: true },
+        { pubkey: opponent, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }
+      ]
+    }));
+  }
   return send(new TransactionInstruction({
     programId,
     data: await instructionData("join_wager"),
@@ -361,85 +620,291 @@ const joinWagerOnChain = async (wager: Wager) => {
       { pubkey: mint, isSigner: false, isWritable: false },
       { pubkey: associatedTokenAddress(mint, opponent), isSigner: false, isWritable: true },
       { pubkey: opponent, isSigner: true, isWritable: true },
+      { pubkey: tokenProgramId, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false }
+    ]
+  }));
+};
+
+const cancelWagerOnChain = async (wager: Wager) => {
+  const maker = new PublicKey(walletAddress);
+  const programId = new PublicKey(appConfig.programId);
+  const mint = new PublicKey(appConfig.usdcMint);
+  const id = u64(BigInt(wager.wagerId));
+  if (wager.asset === "SOL") {
+    return send(new TransactionInstruction({
+      programId,
+      data: await instructionData("cancel_sol_wager"),
+      keys: [
+        { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
+        { pubkey: pda([new TextEncoder().encode("stake"), maker.toBytes()], programId), isSigner: false, isWritable: true },
+        { pubkey: pda([new TextEncoder().encode("wager"), id], programId), isSigner: false, isWritable: true },
+        { pubkey: maker, isSigner: true, isWritable: true }
+      ]
+    }));
+  }
+  return send(new TransactionInstruction({
+    programId,
+    data: await instructionData("cancel_wager"),
+    keys: [
+      { pubkey: pda([new TextEncoder().encode("config")], programId), isSigner: false, isWritable: false },
+      { pubkey: pda([new TextEncoder().encode("stake"), maker.toBytes()], programId), isSigner: false, isWritable: true },
+      { pubkey: pda([new TextEncoder().encode("wager"), id], programId), isSigner: false, isWritable: true },
+      { pubkey: pda([new TextEncoder().encode("wager_vault"), id], programId), isSigner: false, isWritable: true },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: associatedTokenAddress(mint, maker), isSigner: false, isWritable: true },
+      { pubkey: maker, isSigner: true, isWritable: true },
       { pubkey: tokenProgramId, isSigner: false, isWritable: false }
     ]
   }));
 };
 
-const renderWager = (wager: Wager, action = "") => `
-  <div class="wager">
-    <div class="row between"><strong>#${wager.wagerId} · ${displayAmount(wager.amount)} $B1V1 EACH</strong><span class="pill">${wager.status}</span></div>
-    <span class="game-tag">${wager.game === "CS2" ? "CS2" : "QUAKE III"}</span>
-    <span class="muted">${wager.payoutMode === "PER_KILL" ? `${displayAmount(wager.killValue)} $B1V1 / kill · bankroll ${displayAmount(wager.amount)} each` : `winner takes all · fraglimit ${wager.fragLimit}`}</span>
-    ${wager.game === "QUAKE3" && wager.status !== "OPEN" ? `<span class="muted">score ${wager.makerScore}–${wager.opponentScore}</span>` : ""}
-    <span class="muted">${wager.maker.slice(0, 8)}… vs ${wager.opponent ? `${wager.opponent.slice(0, 8)}…` : "waiting"}</span>
-    ${wager.winner ? `<span class="accent">Winner ${wager.winner.slice(0, 12)}…</span>` : ""}
-    ${action}
-  </div>
-`;
+const shortWallet = (wallet: string) => `${wallet.slice(0, 6)}…${wallet.slice(-4)}`;
+const transactionLink = (signature: string | null | undefined, label: string) => signature
+  ? `<a class="tx-link" href="https://solscan.io/tx/${signature}?cluster=devnet" target="_blank" rel="noopener noreferrer">${label} ↗</a>`
+  : "";
+const wagerActions = (wager: Wager) => {
+  if (wager.status === "OPEN" && wager.maker !== walletAddress
+      && (!wager.challenger || wager.challenger === walletAddress)) {
+    const acceptAction = wager.createSignature ? "data-join" : "data-accept-intent";
+    return `<div class="wager-actions"><button ${acceptAction}="${wager.wagerId}">ACCEPT</button>${wager.challenger === walletAddress && !wager.createSignature ? `<button class="secondary decline" data-decline="${wager.wagerId}">DECLINE</button>` : ""}</div>`;
+  }
+  if (wager.status === "OPEN" && wager.maker === walletAddress && wager.createSignature) {
+    return `<button class="secondary decline" data-cancel="${wager.wagerId}">CANCEL & REFUND</button>`;
+  }
+  if (wager.status === "ACCEPTED" && wager.maker === walletAddress) {
+    return `<button data-fund-maker="${wager.wagerId}">FUND ESCROW</button>`;
+  }
+  if (wager.status === "ACCEPTED" && wager.opponent === walletAddress) {
+    return `<span class="action-state">ACCEPTED · WAITING FOR MAKER TO FUND</span>`;
+  }
+  if (wager.status === "MAKER_FUNDED" && wager.opponent === walletAddress) {
+    return `<button data-join="${wager.wagerId}">FUND & START MATCH</button>`;
+  }
+  if (wager.status === "MAKER_FUNDED" && wager.maker === walletAddress) {
+    return `<div class="stack"><span class="action-state">ESCROW FUNDED · WAITING FOR OPPONENT</span><button class="secondary decline" data-cancel="${wager.wagerId}">CANCEL & REFUND</button></div>`;
+  }
+  if (wager.status === "MATCHED" && wager.serverAddress) {
+    const play = wager.game === "QUAKE3"
+      ? `<button data-q3-wager="${wager.wagerId}" ${playUrl(wager.wagerId) ? "" : "disabled"}>PLAY QUAKE III</button>`
+      : `<button data-connect="${wager.serverAddress}" data-connect-game="${wager.game}">CONNECT TO CS2</button>`;
+    if (wager.payoutMode !== "INCREMENTAL") return play;
+    const cashOut = !wager.cashoutRequestedBy
+      ? `<button class="secondary cashout" data-cashout="${wager.wagerId}">REQUEST CASH OUT</button>`
+      : wager.cashoutRequestedBy === walletAddress
+        ? `<button class="secondary cashout" data-cancel-cashout="${wager.wagerId}">CANCEL CASH OUT REQUEST</button>`
+        : `<button class="cashout" data-cashout="${wager.wagerId}">ACCEPT CASH OUT</button>`;
+    const requestState = wager.cashoutRequestedBy
+      ? `<span class="action-state">${wager.cashoutRequestedBy === walletAddress ? "WAITING FOR OPPONENT APPROVAL" : "OPPONENT REQUESTED A CASH OUT"}</span>`
+      : "";
+    return `<div class="stack">${play}${requestState}${cashOut}</div>`;
+  }
+  if (wager.status === "CASHING_OUT") {
+    return `<span class="action-state">CASH OUT APPROVED · RETURNING BOTH BALANCES</span>`;
+  }
+  return "";
+};
+
+const renderWager = (wager: Wager, action = "", history = false) => {
+  const identity = quake3Identities.get(wager.wagerId);
+  const amount = displayAmount(wager.amount, assetDecimals(wager.asset));
+  const decimals = assetDecimals(wager.asset);
+  const payoutRaw = wager.payoutMode === "INCREMENTAL"
+    ? BigInt(wager.incrementValue)
+    : BigInt(wager.amount) * 2n;
+  const payoutEstimate = wager.asset === "SOL" ? solUsdEstimate(payoutRaw) : "";
+  const payout = wager.payoutMode === "INCREMENTAL"
+    ? `${displayAmount(wager.incrementValue, decimals)} ${wager.asset}${payoutEstimate} / SCORE`
+    : `${displayAmount(payoutRaw.toString(), decimals)} ${wager.asset}${payoutEstimate} POT`;
+  const liveBalances = liveWagerBalances(wager);
+  const balanceText = liveBalances
+    ? `${displayAmount(liveBalances.maker.toString(), decimals)} ${wager.asset} VS ${displayAmount(liveBalances.opponent.toString(), decimals)} ${wager.asset}`
+    : `${displayAmount(wager.makerRemaining, decimals)} ${wager.asset} — ${displayAmount(wager.opponentRemaining, decimals)} ${wager.asset}`;
+  const opponent = wager.opponent ?? wager.challenger;
+  const txLinks = [
+    transactionLink(wager.createSignature, "CHALLENGE TX"),
+    transactionLink(wager.joinSignature, "JOIN TX"),
+    transactionLink(
+      wager.settlementSignature,
+      wager.status === "DECLINED" ? "REFUND TX" : wager.status === "CASHED_OUT" ? "CASH OUT TX" : "SETTLEMENT TX"
+    ),
+    !wager.createSignature && !wager.joinSignature && !wager.settlementSignature
+      ? transactionLink(wager.chainSignature, "LATEST TX") : ""
+  ].filter(Boolean).join("");
+  return `
+    <article class="wager ${history ? "wager-history" : ""}" data-status="${wager.status}">
+      <header class="wager-header">
+        <div><small>CHALLENGE #${wager.wagerId}</small><strong>${amount} ${wager.asset} <em>PER PLAYER</em></strong></div>
+        <span class="pill status-pill">${wager.status}</span>
+      </header>
+      <div class="wager-tags"><span>${wager.game === "CS2" ? "CS2" : "QUAKE III"}</span><span>${wager.payoutMode === "INCREMENTAL" ? "PER SCORE" : "WINNER TAKES ALL"}</span></div>
+      <div class="wager-detail-grid">
+        <div><small>PAYOUT</small><strong>${payout}</strong></div>
+        <div><small>${wager.payoutMode === "INCREMENTAL" ? (liveBalances ? "LIVE BALANCE" : "ESCROW") : "MATCH RULE"}</small><strong>${wager.payoutMode === "INCREMENTAL" ? balanceText : `FRAGLIMIT ${wager.fragLimit}`}</strong></div>
+        ${wager.game === "QUAKE3" && wager.status !== "OPEN" ? `<div><small>SCORE</small><strong>${wager.makerScore} — ${wager.opponentScore}</strong></div>` : ""}
+      </div>
+      <div class="participants"><span>${wager.maker === walletAddress ? "YOU" : shortWallet(wager.maker)}</span><b>VS</b><span>${opponent ? (opponent === walletAddress ? "YOU" : shortWallet(opponent)) : "OPEN"}</span></div>
+      ${identity ? `<div class="identity-state"><i class="${identity.connected ? "connected" : ""}"></i><span>${identity.playerName}</span><b>${identity.connected ? "SERVER LINKED" : "WAITING FOR GAME"}</b></div>` : ""}
+      ${wager.winner ? `<div class="winner-line">WINNER <strong>${wager.winner === walletAddress ? "YOU" : shortWallet(wager.winner)}</strong></div>` : ""}
+      ${txLinks ? `<nav class="transaction-links" aria-label="Challenge transactions">${txLinks}</nav>` : ""}
+      ${action}
+    </article>
+  `;
+};
 
 const refreshAccess = async () => {
   if (!walletAddress) return;
   const access = await api<Access>(`/access/${walletAddress}`);
   accessActive = access.active && !access.banned;
-  element("access-status").textContent = access.banned ? "BANNED" : access.active ? "ACTIVE" : "LOCKED";
-  element("stake-copy").textContent = `${displayAmount(access.amount)} staked · ${displayAmount(access.requiredStake)} required`;
-  element<HTMLButtonElement>("stake").disabled = access.banned;
+  element("access-status").textContent = access.banned
+    ? "BANNED"
+    : appConfig.stakingEnabled
+      ? access.active ? "ACTIVE" : "LOCKED"
+      : "OPEN";
+  element("stake-copy").textContent = appConfig.stakingEnabled
+    ? `${displayAmount(access.amount, stakeDecimals)} staked · ${displayAmount(access.requiredStake, stakeDecimals)} required`
+    : "Token staking is disabled. Wallet access is open.";
+  element<HTMLButtonElement>("stake").disabled = access.banned || !appConfig.stakingEnabled;
   element<HTMLButtonElement>("create-wager").disabled = !accessActive || !selectedGame;
-  element<HTMLButtonElement>("add-friend").disabled = !accessActive || !selectedGame;
+  element<HTMLButtonElement>("add-friend").disabled = !accessActive;
   element("workspace").classList.toggle("access-locked", !accessActive);
 };
 
 const refreshFriends = async () => {
   if (!walletAddress) return;
-  const friends = await api<{ wallet: string }[]>(`/friends/${walletAddress}`);
+  const friends = await api<{ wallet: string; username: string | null }[]>(`/friends/${walletAddress}`);
   element("friends").innerHTML = friends.length
-    ? friends.map((friend) => `<span class="wallet">${friend.wallet}</span>`).join("")
+    ? friends.map((friend) => `
+        <button class="friend-entry" type="button" data-challenge-wallet="${friend.wallet}">
+          <span class="friend-identity"><strong>${friend.username ?? shortWallet(friend.wallet)}</strong><small class="wallet">${friend.wallet}</small></span><b>CHALLENGE →</b>
+        </button>
+      `).join("")
     : `<span class="empty">No friends yet.</span>`;
+};
+
+const refreshBalances = async () => {
+  if (!walletAddress) return;
+  if (appConfig.mockChain) {
+    element("wallet-balances").textContent = "MOCK CHAIN BALANCES";
+    return;
+  }
+  try {
+    const owner = new PublicKey(walletAddress);
+    const usdcAccount = associatedTokenAddress(new PublicKey(appConfig.usdcMint), owner);
+    const [lamports, usdc] = await Promise.all([
+      connection.getBalance(owner, "confirmed"),
+      connection.getTokenAccountBalance(usdcAccount, "confirmed")
+        .then((balance) => balance.value.amount)
+        .catch(() => "0")
+    ]);
+    element("wallet-balances").textContent = `${displayAmount(String(lamports), 9)} SOL · ${displayAmount(usdc, 6)} USDC`;
+  } catch {
+    element("wallet-balances").textContent = "BALANCE TEMPORARILY UNAVAILABLE";
+  }
 };
 
 const refreshWagers = async () => {
   if (!selectedGame) return;
   const gameQuery = `game=${selectedGame}`;
   const open = await api<Wager[]>(`/wagers?status=OPEN&${gameQuery}`);
-  element("open-wagers").innerHTML = open.length
-    ? open.map((wager) => {
-        const available = walletAddress && wager.maker !== walletAddress && (!wager.challenger || wager.challenger === walletAddress);
-        return renderWager(wager, available ? `<button data-join="${wager.wagerId}">Accept</button>` : "");
-      }).join("")
+  const visibleOpen = open
+    .filter((wager) => !wager.challenger || wager.challenger === walletAddress || wager.maker === walletAddress)
+    .slice(0, 3);
+  element("open-wagers").innerHTML = visibleOpen.length
+    ? visibleOpen.map((wager) => renderWager(wager, wagerActions(wager))).join("")
     : `<span class="empty">No open wagers.</span>`;
   const mine = walletAddress ? await api<Wager[]>(`/wagers?wallet=${walletAddress}&${gameQuery}`) : [];
-  element("my-wagers").innerHTML = mine.length
-    ? mine.map((wager) => renderWager(
-        wager,
-        wager.status === "MATCHED" && wager.serverAddress
-          ? wager.game === "QUAKE3"
-            ? `<button data-q3-wager="${wager.wagerId}" ${playUrl(wager.wagerId) ? "" : "disabled"}>PLAY QUAKE III</button>`
-            : `<button data-connect="${wager.serverAddress}" data-connect-game="${wager.game}">CONNECT TO CS2</button>`
-          : ""
-      )).join("")
-    : `<span class="empty">No matches yet.</span>`;
+  if (selectedGame === "QUAKE3") {
+    await Promise.all(mine
+      .filter((wager) => ["ACCEPTED", "MAKER_FUNDED", "MATCHED"].includes(wager.status))
+      .map((wager) => loadQuake3Identity(wager.wagerId).catch(() => undefined)));
+  }
+  const recent = mine.slice(0, 3);
+  const history = mine.slice(3);
+  element("my-wagers").innerHTML = recent.length
+    ? recent.map((wager) => renderWager(wager, wagerActions(wager))).join("")
+    : `<span class="empty">No recent challenges.</span>`;
+  element("history-count").textContent = String(history.length);
+  element("history-wagers").innerHTML = history.length
+    ? history.map((wager) => renderWager(wager, "", true)).join("")
+    : `<span class="empty">No challenge history.</span>`;
   const matched = await api<Wager[]>(`/wagers?status=MATCHED&${gameQuery}`);
   element("admin-wagers").innerHTML = matched.length
     ? matched.map((wager) => renderWager(wager, `<div class="row"><button data-winner-id="${wager.wagerId}" data-winner="${wager.maker}">Maker won</button><button class="secondary" data-winner-id="${wager.wagerId}" data-winner="${wager.opponent}">Opponent won</button></div>`)).join("")
     : `<span class="empty">No matched wagers.</span>`;
 };
 
+const finishWalletConnection = async () => {
+  accessActive = !appConfig.stakingEnabled;
+  const refreshes = await Promise.allSettled([
+    refreshAccess(),
+    refreshFriends(),
+    refreshWagers(),
+    refreshBalances()
+  ]);
+  const partialFailure = refreshes.some((result) => result.status === "rejected");
+  notice(partialFailure ? "Wallet connected; some live data is still loading." : `Connected as ${accountUsername}.`);
+};
+
 element("connect").addEventListener("click", async () => {
   try {
-    const result = await provider().connect();
-    walletAddress = result.publicKey.toBase58();
+    const publicKey = await connectPhantom();
+    walletAddress = publicKey.toBase58();
     await authenticate();
     element("wallet").textContent = walletAddress;
-    await Promise.all([refreshAccess(), refreshFriends(), refreshWagers()]);
+    element("connect").textContent = "PHANTOM CONNECTED";
+    const account = await api<Account>(`/account/${walletAddress}`);
+    accountUsername = account.username ?? "";
+    element("account-name").textContent = accountUsername;
+    element("account-settings").classList.remove("hidden");
+    if (!accountUsername) {
+      showUsernameSettings(true);
+      return;
+    }
+    await finishWalletConnection();
   } catch (error) {
-    notice(error instanceof Error ? error.message : "Wallet connection failed");
+    notice(walletError(error, "Phantom connection failed"));
+  }
+});
+
+element("account-settings").addEventListener("click", () => showUsernameSettings(false));
+element("cancel-username").addEventListener("click", hideUsernameSettings);
+element<HTMLFormElement>("username-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const save = element<HTMLButtonElement>("save-username");
+  const errorLine = element("username-error");
+  try {
+    save.disabled = true;
+    save.textContent = "SAVING…";
+    errorLine.classList.add("hidden");
+    const account = await api<Account>(`/account/${walletAddress}/username`, {
+      method: "PUT",
+      body: JSON.stringify({ username: element<HTMLInputElement>("username-input").value })
+    });
+    accountUsername = account.username ?? "";
+    element("account-name").textContent = accountUsername;
+    const completeSetup = usernameSetupPending;
+    usernameSetupPending = false;
+    element("username-modal").classList.add("hidden");
+    if (completeSetup) await finishWalletConnection();
+    else {
+      await refreshWagers();
+      notice(`Username changed to ${accountUsername}. Pending matches were updated.`);
+    }
+  } catch (error) {
+    errorLine.textContent = error instanceof Error ? error.message : "Unable to save username";
+    errorLine.classList.remove("hidden");
+  } finally {
+    save.disabled = false;
+    save.textContent = "SAVE USERNAME";
   }
 });
 
 element("stake").addEventListener("click", async () => {
   try {
-    const amount = rawAmount(element<HTMLInputElement>("stake-amount").value);
+    if (!appConfig.stakingEnabled) throw new Error("Staking is disabled");
+    const amount = rawAmount(element<HTMLInputElement>("stake-amount").value, stakeDecimals);
     if (appConfig.mockChain) {
       await api(`/users/${walletAddress}/mock-stake`, { method: "POST", body: JSON.stringify({ amount: amount.toString() }) });
     } else {
@@ -453,14 +918,22 @@ element("stake").addEventListener("click", async () => {
 });
 
 element("add-friend").addEventListener("click", async () => {
+  const button = element<HTMLButtonElement>("add-friend");
   try {
     const friend = element<HTMLInputElement>("friend-wallet").value.trim();
+    if (!friend) throw new Error("Enter the other player's wallet address");
+    new PublicKey(friend);
+    button.disabled = true;
+    button.textContent = "ADDING…";
     await api("/friends", { method: "POST", body: JSON.stringify({ owner: walletAddress, friend }) });
     element<HTMLInputElement>("friend-wallet").value = "";
     await refreshFriends();
     notice("Friend added");
   } catch (error) {
     notice(error instanceof Error ? error.message : "Friend request failed");
+  } finally {
+    button.textContent = "ADD";
+    button.disabled = !accessActive;
   }
 });
 
@@ -468,23 +941,20 @@ element("create-wager").addEventListener("click", async () => {
   try {
     if (!selectedGame) throw new Error("Select a game first");
     const challenger = element<HTMLInputElement>("challenger").value.trim() || null;
-    const amount = rawAmount(element<HTMLInputElement>("wager-amount").value).toString();
-    const payoutMode = element<HTMLSelectElement>("payout-mode").value as Wager["payoutMode"];
-    const killValue = payoutMode === "PER_KILL"
-      ? rawAmount(element<HTMLInputElement>("kill-value").value).toString()
+    const asset = checkedValue<WagerAsset>("wager-asset");
+    const amount = rawAmount(element<HTMLInputElement>("wager-amount").value, assetDecimals(asset)).toString();
+    const payoutMode = checkedValue<Wager["payoutMode"]>("payout-mode");
+    const incrementValue = payoutMode === "INCREMENTAL"
+      ? rawAmount(element<HTMLInputElement>("increment-value").value, assetDecimals(asset)).toString()
       : "0";
     const fragLimit = Number(element<HTMLInputElement>("frag-limit").value);
     const wager = await api<Wager>("/wagers", {
       method: "POST",
-      body: JSON.stringify({ maker: walletAddress, challenger, amount, game: selectedGame, payoutMode, killValue, fragLimit })
+      body: JSON.stringify({ maker: walletAddress, challenger, amount, asset, game: selectedGame, payoutMode, incrementValue, fragLimit })
     });
     rememberIdentity(wager);
-    if (!appConfig.mockChain) {
-      const signature = await createWagerOnChain(wager);
-      await api(`/wagers/${wager.wagerId}/chain`, { method: "POST", body: JSON.stringify({ maker: walletAddress, signature }) });
-    }
     await refreshWagers();
-    notice(`Wager #${wager.wagerId} opened`);
+    notice(`Challenge #${wager.wagerId} sent. No funds move on-chain until another player accepts.`);
   } catch (error) {
     notice(error instanceof Error ? error.message : "Wager creation failed");
   }
@@ -492,21 +962,93 @@ element("create-wager").addEventListener("click", async () => {
 
 document.addEventListener("click", async (event) => {
   const target = event.target as HTMLElement;
-  const joinId = target.dataset.join;
+  const joinId = target.closest<HTMLElement>("[data-join]")?.dataset.join;
+  const acceptIntentId = target.closest<HTMLElement>("[data-accept-intent]")?.dataset.acceptIntent;
+  const fundMakerId = target.closest<HTMLElement>("[data-fund-maker]")?.dataset.fundMaker;
+  const declineId = target.closest<HTMLElement>("[data-decline]")?.dataset.decline;
+  const cancelId = target.closest<HTMLElement>("[data-cancel]")?.dataset.cancel;
+  const cashoutId = target.closest<HTMLElement>("[data-cashout]")?.dataset.cashout;
+  const cancelCashoutId = target.closest<HTMLElement>("[data-cancel-cashout]")?.dataset.cancelCashout;
   const server = target.dataset.connect;
   const connectGame = target.dataset.connectGame as Game | undefined;
   const q3WagerId = target.dataset.q3Wager;
   const winnerId = target.dataset.winnerId;
+  const challengeWallet = target.closest<HTMLElement>("[data-challenge-wallet]")?.dataset.challengeWallet;
   try {
+    if (challengeWallet) {
+      element<HTMLInputElement>("challenger").value = challengeWallet;
+      notice("Opponent selected for the next challenge");
+    }
+    if (acceptIntentId) {
+      const accepted = await api<Wager>(`/wagers/${acceptIntentId}/accept-intent`, {
+        method: "POST",
+        body: JSON.stringify({ opponent: walletAddress })
+      });
+      rememberIdentity(accepted);
+      await refreshWagers();
+      notice(`Challenge #${acceptIntentId} accepted. No money has moved yet; the maker can now fund the escrow.`);
+    }
+    if (fundMakerId) {
+      const wagers = await api<Wager[]>(`/wagers?wallet=${walletAddress}&game=${selectedGame}`);
+      const wager = wagers.find((item) => item.wagerId === fundMakerId);
+      if (!wager || wager.status !== "ACCEPTED") throw new Error("Challenge is not ready for funding");
+      const signature = appConfig.mockChain ? `mock-maker-fund-${fundMakerId}` : await createWagerOnChain(wager);
+      await api(`/wagers/${fundMakerId}/chain`, {
+        method: "POST",
+        body: JSON.stringify({ maker: walletAddress, signature })
+      });
+      await Promise.all([refreshWagers(), refreshBalances()]);
+      notice(`Challenge #${fundMakerId} maker escrow funded.`, appConfig.mockChain ? undefined : signature);
+    }
     if (joinId) {
-      const wagers = await api<Wager[]>(`/wagers?status=OPEN&game=${selectedGame}`);
+      const wagers = await api<Wager[]>(`/wagers?wallet=${walletAddress}&game=${selectedGame}`);
       const wager = wagers.find((item) => item.wagerId === joinId);
-      if (!wager) throw new Error("Wager is unavailable");
+      if (!wager || (wager.status !== "MAKER_FUNDED" && !(wager.status === "OPEN" && wager.createSignature))) {
+        throw new Error("Challenge is no longer ready to start");
+      }
       const signature = appConfig.mockChain ? undefined : await joinWagerOnChain(wager);
       const accepted = await api<Wager>(`/wagers/${joinId}/accept`, { method: "POST", body: JSON.stringify({ opponent: walletAddress, signature }) });
       rememberIdentity(accepted);
+      await Promise.all([refreshWagers(), refreshBalances()]);
+      notice(`Challenge #${joinId} accepted and funded on Solana devnet.`, signature);
+    }
+    if (declineId) {
+      await api(`/wagers/${declineId}/decline`, {
+        method: "POST",
+        body: JSON.stringify({ challenger: walletAddress })
+      });
       await refreshWagers();
-      notice("Wager accepted");
+      notice(`Challenge #${declineId} declined. No funds had moved on-chain.`);
+    }
+    if (cancelId) {
+      const wagers = await api<Wager[]>(`/wagers?wallet=${walletAddress}&game=${selectedGame}`);
+      const wager = wagers.find((item) => item.wagerId === cancelId);
+      if (!wager) throw new Error("Challenge is unavailable");
+      const signature = appConfig.mockChain ? `mock-cancel-${cancelId}` : await cancelWagerOnChain(wager);
+      await api(`/wagers/${cancelId}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ maker: walletAddress, signature })
+      });
+      await Promise.all([refreshWagers(), refreshBalances()]);
+      notice(`Challenge #${cancelId} cancelled and escrow refunded.`, appConfig.mockChain ? undefined : signature);
+    }
+    if (cashoutId) {
+      const result = await api<{ state: "REQUESTED" | "CASHING_OUT" }>(`/wagers/${cashoutId}/cashout`, {
+        method: "POST",
+        body: JSON.stringify({ wallet: walletAddress })
+      });
+      await refreshWagers();
+      notice(result.state === "CASHING_OUT"
+        ? `Cash out approved for #${cashoutId}. The chain worker is returning both live balances.`
+        : `Cash out requested for #${cashoutId}. The other player must approve it.`);
+    }
+    if (cancelCashoutId) {
+      await api(`/wagers/${cancelCashoutId}/cashout/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ wallet: walletAddress })
+      });
+      await refreshWagers();
+      notice(`Cash-out request cancelled for #${cancelCashoutId}.`);
     }
     if (q3WagerId) {
       const url = playUrl(q3WagerId);
@@ -535,11 +1077,65 @@ document.addEventListener("click", async (event) => {
 });
 
 element("refresh").addEventListener("click", refreshWagers);
-
-element("payout-mode").addEventListener("change", () => {
-  const perKill = element<HTMLSelectElement>("payout-mode").value === "PER_KILL";
-  element<HTMLInputElement>("kill-value").disabled = !perKill;
+element("toggle-history").addEventListener("click", () => {
+  const history = element("challenge-history");
+  const open = history.classList.toggle("hidden") === false;
+  element<HTMLButtonElement>("toggle-history").firstChild!.textContent = open ? "HIDE HISTORY " : "HISTORY ";
 });
+
+const updateWagerEstimate = () => {
+  const asset = checkedValue<WagerAsset>("wager-asset");
+  const amount = Number(element<HTMLInputElement>("wager-amount").value);
+  const estimate = element("wager-usd-estimate");
+  if (!Number.isFinite(amount) || amount <= 0) {
+    estimate.textContent = "Enter an amount to see the per-player estimate.";
+  } else if (asset === "USDC") {
+    estimate.textContent = `≈ $${amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD per player`;
+  } else if (solUsdPrice) {
+    estimate.textContent = `≈ $${(amount * solUsdPrice).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD per player · live estimate`;
+  } else {
+    estimate.textContent = "SOL wager · USD estimate temporarily unavailable";
+  }
+};
+
+const refreshSolPrice = async () => {
+  try {
+    solUsdPrice = (await api<{ usd: number }>("/prices/sol")).usd;
+  } catch {
+    solUsdPrice = null;
+  }
+  updateWagerEstimate();
+};
+
+const syncWagerControls = () => {
+  const asset = checkedValue<WagerAsset>("wager-asset");
+  const incrementalOption = element<HTMLInputElement>("incremental-mode");
+  const winnerTakeAll = document.querySelector<HTMLInputElement>('input[name="payout-mode"][value="WINNER_TAKE_ALL"]')!;
+  const incrementalSupported = selectedGame === "QUAKE3";
+  incrementalOption.disabled = !incrementalSupported;
+  element("incremental-choice").classList.toggle("unavailable", !incrementalSupported);
+  element("incremental-choice").setAttribute("aria-disabled", String(!incrementalSupported));
+  if (!incrementalSupported && incrementalOption.checked) winnerTakeAll.checked = true;
+  const incremental = incrementalOption.checked;
+  element<HTMLInputElement>("increment-value").disabled = !incremental;
+  element("increment-fields").classList.toggle("hidden", !incremental);
+  element("frag-limit-fields").classList.toggle("hidden", selectedGame !== "QUAKE3" || incremental);
+  element("wager-unit").textContent = asset;
+  element("increment-unit").textContent = asset;
+  element("payout-help").textContent = incrementalSupported
+    ? `Both payout structures are available in ${asset}. Per-score payouts update escrow and balances after every verified frag.`
+    : "Per-score payouts require Quake III. This arena currently settles winner-take-all only.";
+  element("payout-help").classList.toggle("available", incrementalSupported);
+  const step = asset === "SOL" ? "0.000000001" : "0.000001";
+  element<HTMLInputElement>("wager-amount").step = step;
+  element<HTMLInputElement>("increment-value").step = step;
+  updateWagerEstimate();
+};
+
+document.querySelectorAll<HTMLInputElement>('input[name="payout-mode"], input[name="wager-asset"]')
+  .forEach((input) => input.addEventListener("change", syncWagerControls));
+element<HTMLInputElement>("wager-amount").addEventListener("input", updateWagerEstimate);
+syncWagerControls();
 
 document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((button) => {
   button.addEventListener("click", async () => {
@@ -556,6 +1152,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((button) => 
     element("workspace").classList.toggle("access-locked", !accessActive);
     element<HTMLButtonElement>("create-wager").disabled = !accessActive;
     element<HTMLButtonElement>("add-friend").disabled = !accessActive;
+    syncWagerControls();
     try {
       await refreshWagers();
       element("workspace").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -568,9 +1165,24 @@ document.querySelectorAll<HTMLButtonElement>("[data-game]").forEach((button) => 
 const start = async () => {
   try {
     appConfig = await api<AppConfig>("/config");
+    void refreshSolPrice();
+    if (appConfig.stakingEnabled) {
+      element("access-panel").classList.remove("hidden");
+      element("hero-tagline").textContent = "Stake $B1V1. Choose your arena. Challenge a rival.";
+    }
   } catch (error) {
     notice(error instanceof Error ? error.message : "API unavailable");
   }
 };
 
 void start();
+
+let refreshInFlight = false;
+window.setInterval(() => {
+  if (!walletAddress || !selectedGame || document.visibilityState !== "visible" || refreshInFlight) return;
+  refreshInFlight = true;
+  void Promise.all([refreshWagers(), refreshBalances()])
+    .catch(() => undefined)
+    .finally(() => { refreshInFlight = false; });
+}, 2_500);
+window.setInterval(() => void refreshSolPrice(), 5 * 60_000);

@@ -1,4 +1,7 @@
-use crate::constant::{seeds, CANCELLED, OPEN, PER_KILL, WINNER_TAKE_ALL};
+use super::wager_helpers::{
+    increment_active_wagers, open_wager, require_wager_access, validate_wager_terms,
+};
+use crate::constant::{seeds, CANCELLED, OPEN};
 use crate::errors::WagerError;
 use crate::event::WagerCreatedEvent;
 use crate::state::{Config, UserStake, Wager};
@@ -11,10 +14,12 @@ pub struct CreateWager<'info> {
     #[account(seeds = [seeds::CONFIG], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(
-        mut,
+        init_if_needed,
+        payer = maker,
+        space = 8 + UserStake::INIT_SPACE,
         seeds = [seeds::STAKE, maker.key().as_ref()],
-        bump = maker_stake.bump,
-        constraint = maker_stake.owner == maker.key()
+        bump,
+        constraint = maker_stake.owner == Pubkey::default() || maker_stake.owner == maker.key()
     )]
     pub maker_stake: Account<'info, UserStake>,
     #[account(
@@ -34,7 +39,7 @@ pub struct CreateWager<'info> {
         token::authority = wager
     )]
     pub wager_vault: Account<'info, TokenAccount>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -55,23 +60,16 @@ pub fn create_wager(
     challenger: Pubkey,
     amount: u64,
     payout_mode: u8,
-    kill_value: u64,
+    increment_value: u64,
 ) -> Result<()> {
-    require!(amount > 0, WagerError::InvalidWagerAmount);
-    require!(
-        payout_mode == WINNER_TAKE_ALL || payout_mode == PER_KILL,
-        WagerError::InvalidPayoutMode
-    );
-    require!(
-        (payout_mode == WINNER_TAKE_ALL && kill_value == 0)
-            || (payout_mode == PER_KILL && kill_value > 0 && kill_value <= amount),
-        WagerError::InvalidKillValue
-    );
-    require!(!ctx.accounts.maker_stake.banned, WagerError::UserBanned);
-    require!(
-        ctx.accounts.maker_stake.amount >= ctx.accounts.config.required_stake,
-        WagerError::StakeRequired
-    );
+    validate_wager_terms(amount, payout_mode, increment_value, true)?;
+    let maker_stake = &mut ctx.accounts.maker_stake;
+    require_wager_access(
+        maker_stake,
+        ctx.accounts.maker.key(),
+        ctx.bumps.maker_stake,
+        &ctx.accounts.config,
+    )?;
     token::transfer(
         CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
@@ -84,34 +82,25 @@ pub fn create_wager(
         amount,
     )?;
     let wager = &mut ctx.accounts.wager;
-    wager.wager_id = wager_id;
-    wager.maker = ctx.accounts.maker.key();
-    wager.challenger = challenger;
-    wager.opponent = Pubkey::default();
-    wager.amount = amount;
-    wager.token_mint = ctx.accounts.token_mint.key();
-    wager.winner = Pubkey::default();
-    wager.status = OPEN;
-    wager.payout_mode = payout_mode;
-    wager.kill_value = kill_value;
-    wager.maker_remaining = amount;
-    wager.opponent_remaining = amount;
-    wager.maker_kills = 0;
-    wager.opponent_kills = 0;
-    wager.bump = ctx.bumps.wager;
-    ctx.accounts.maker_stake.active_wagers = ctx
-        .accounts
-        .maker_stake
-        .active_wagers
-        .checked_add(1)
-        .ok_or(WagerError::MathOverflow)?;
+    open_wager(
+        wager,
+        wager_id,
+        ctx.accounts.maker.key(),
+        challenger,
+        amount,
+        ctx.accounts.token_mint.key(),
+        payout_mode,
+        increment_value,
+        ctx.bumps.wager,
+    );
+    increment_active_wagers(maker_stake)?;
     emit!(WagerCreatedEvent {
         wager_id,
         maker: wager.maker,
         challenger,
         amount,
         payout_mode,
-        kill_value,
+        increment_value,
     });
     Ok(())
 }
@@ -142,7 +131,7 @@ pub struct CancelWager<'info> {
         token::authority = wager
     )]
     pub wager_vault: Account<'info, TokenAccount>,
-    #[account(address = config.token_mint)]
+    #[account(address = config.usdc_mint)]
     pub token_mint: Account<'info, Mint>,
     #[account(
         mut,
@@ -171,6 +160,55 @@ pub fn cancel_wager(ctx: Context<CancelWager>) -> Result<()> {
         ctx.accounts.wager.amount,
     )?;
     ctx.accounts.wager.status = CANCELLED;
+    ctx.accounts.maker_stake.active_wagers = ctx
+        .accounts
+        .maker_stake
+        .active_wagers
+        .checked_sub(1)
+        .ok_or(WagerError::MathOverflow)?;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct DeclineWager<'info> {
+    #[account(seeds = [seeds::CONFIG], bump = config.bump, has_one = chain_authority)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [seeds::STAKE, wager.maker.as_ref()], bump = maker_stake.bump, constraint = maker_stake.owner == wager.maker)]
+    pub maker_stake: Account<'info, UserStake>,
+    #[account(mut, seeds = [seeds::WAGER, &wager.wager_id.to_le_bytes()], bump = wager.bump)]
+    pub wager: Account<'info, Wager>,
+    #[account(mut, seeds = [seeds::WAGER_VAULT, &wager.wager_id.to_le_bytes()], bump, token::mint = token_mint, token::authority = wager)]
+    pub wager_vault: Account<'info, TokenAccount>,
+    #[account(address = config.usdc_mint)]
+    pub token_mint: Account<'info, Mint>,
+    #[account(mut, token::mint = token_mint, constraint = maker_token.owner == wager.maker)]
+    pub maker_token: Account<'info, TokenAccount>,
+    pub chain_authority: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+}
+
+pub fn decline_wager(ctx: Context<DeclineWager>) -> Result<()> {
+    require!(ctx.accounts.wager.status == OPEN, WagerError::WagerNotOpen);
+    require!(
+        ctx.accounts.wager.challenger != Pubkey::default(),
+        WagerError::WagerNotReserved
+    );
+    let wager_id = ctx.accounts.wager.wager_id.to_le_bytes();
+    let signer_seeds: &[&[u8]] = &[seeds::WAGER, &wager_id, &[ctx.accounts.wager.bump]];
+    token::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.wager_vault.to_account_info(),
+                to: ctx.accounts.maker_token.to_account_info(),
+                authority: ctx.accounts.wager.to_account_info(),
+            },
+            &[signer_seeds],
+        ),
+        ctx.accounts.wager.amount,
+    )?;
+    ctx.accounts.wager.status = CANCELLED;
+    ctx.accounts.wager.maker_remaining = 0;
     ctx.accounts.maker_stake.active_wagers = ctx
         .accounts
         .maker_stake

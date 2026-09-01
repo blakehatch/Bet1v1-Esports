@@ -22,6 +22,8 @@ pub enum WagerError {
     UserBanned,
     #[msg("Required stake is not met")]
     StakeRequired,
+    #[msg("Staking is disabled")]
+    StakingDisabled,
     #[msg("Insufficient staked tokens")]
     InsufficientStake,
     #[msg("Stake is locked by an active wager")]
@@ -32,12 +34,14 @@ pub enum WagerError {
     WagerNotMatched,
     #[msg("Wager is reserved for another player")]
     WagerReserved,
+    #[msg("Wager is not a reserved challenge")]
+    WagerNotReserved,
     #[msg("Math overflow")]
     MathOverflow,
     #[msg("Invalid payout mode")]
     InvalidPayoutMode,
-    #[msg("Invalid per-kill value")]
-    InvalidKillValue,
-    #[msg("Invalid kill sequence")]
-    InvalidKillSequence,
+    #[msg("Invalid incremental payout value")]
+    InvalidIncrementValue,
+    #[msg("Invalid score sequence")]
+    InvalidScoreSequence,
 }
